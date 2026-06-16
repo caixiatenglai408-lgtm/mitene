@@ -14,6 +14,10 @@ from zoneinfo import ZoneInfo
 
 from app_paths import APP_ROOT, DATA_ROOT
 from crypto_util import decrypt_secret, encrypt_secret
+from data_store import read_accounts as _read_accounts_payload
+from data_store import read_settings as _read_settings_payload
+from data_store import write_accounts as _write_accounts_payload
+from data_store import write_settings as _write_settings_payload
 
 ROOT = APP_ROOT
 DATA_DIR = DATA_ROOT / "data"
@@ -129,9 +133,9 @@ def _normalize_schedule(schedule: dict) -> dict[str, dict[str, bool]]:
 
 def load_settings() -> Settings:
     _ensure_data_dir()
-    if not SETTINGS_PATH.exists():
+    raw = _read_settings_payload(SETTINGS_PATH)
+    if raw is None:
         return Settings()
-    raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     schedule = _normalize_schedule(raw.get("schedule") or {})
     last_run = raw.get("last_run")
     settings = Settings(
@@ -193,9 +197,9 @@ def save_settings(settings: Settings) -> None:
     import sys
 
     _ensure_data_dir()
-    SETTINGS_PATH.write_text(
-        json.dumps(settings.to_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    _write_settings_payload(
+        SETTINGS_PATH,
+        settings.to_dict(),
     )
     if sys.platform in ("darwin", "win32"):
         try:
@@ -208,9 +212,9 @@ def save_settings(settings: Settings) -> None:
 
 def load_accounts() -> list[Account]:
     _ensure_data_dir()
-    if not ACCOUNTS_PATH.exists():
+    raw = _read_accounts_payload(ACCOUNTS_PATH)
+    if raw is None:
         return []
-    raw = json.loads(ACCOUNTS_PATH.read_text(encoding="utf-8"))
     accounts = []
     for row in raw.get("accounts", []):
         accounts.append(
@@ -238,10 +242,7 @@ def save_accounts(accounts: list[Account]) -> None:
             for a in accounts
         ]
     }
-    ACCOUNTS_PATH.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _write_accounts_payload(ACCOUNTS_PATH, payload)
 
 
 def get_account(account_id: str) -> Account | None:

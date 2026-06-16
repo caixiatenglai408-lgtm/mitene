@@ -101,8 +101,12 @@ def _remove_client_tab(tab_id: str) -> None:
 
 @app.context_processor
 def inject_ui_config():
+    from data_store import storage_mode, storage_warning
+
     return {
         "mitene_auto_exit": _auto_exit_enabled(),
+        "storage_mode": storage_mode(),
+        "storage_warning": storage_warning(),
     }
 
 
@@ -366,6 +370,7 @@ def api_client_heartbeat_status():
 
 
 def _build_data_payload() -> dict:
+    from data_store import storage_mode, storage_warning
     from platform_schedule import platform_schedule_status
 
     s = load_settings()
@@ -385,6 +390,8 @@ def _build_data_payload() -> dict:
         "mac_schedule": info,
         "server_time": datetime.now(JST).strftime("%H:%M"),
         "last_run": last_run,
+        "storage_mode": storage_mode(),
+        "storage_warning": storage_warning(),
     }
 
 

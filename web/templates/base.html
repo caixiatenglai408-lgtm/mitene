@@ -11,7 +11,7 @@
   <link rel="icon" href="{{ url_for('static', filename='icons/deco-app-icon-512.png') }}" type="image/png" sizes="512x512">
   <link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/deco-app-icon-1024.png') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=17">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=18">
 </head>
 <body data-page="{{ request.endpoint or '' }}">
   <div class="wrap">
@@ -28,6 +28,9 @@
       </div>
       <span id="sync-indicator" class="sync-indicator" title="3分おきに自動で最新状態に更新します"></span>
     </nav>
+    {% if storage_warning %}
+    <div class="flash warn" role="status">{{ storage_warning }}</div>
+    {% endif %}
     {% block content %}{% endblock %}
   </div>
   <script src="{{ url_for('static', filename='sync.js') }}?v=1"></script>

@@ -433,6 +433,7 @@ button.btn-toggle-auto.btn-toggle-auto-off:active {
 .flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; }
 .flash.ok { background: #dcfce7; color: #166534; }
 .flash.err { background: #fee2e2; color: #991b1b; }
+.flash.warn { background: #fef3c7; color: #92400e; }
 
 .hint { font-size: 0.82rem; color: var(--gray); margin-top: 8px; }
 
