@@ -370,7 +370,7 @@ def api_client_heartbeat_status():
 
 
 def _build_data_payload() -> dict:
-    from data_store import storage_mode, storage_warning
+    from data_store import storage_debug, storage_mode, storage_warning
     from platform_schedule import platform_schedule_status
 
     s = load_settings()
@@ -392,6 +392,7 @@ def _build_data_payload() -> dict:
         "last_run": last_run,
         "storage_mode": storage_mode(),
         "storage_warning": storage_warning(),
+        "storage_debug": storage_debug(),
     }
 
 

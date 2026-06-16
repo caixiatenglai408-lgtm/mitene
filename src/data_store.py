@@ -1,4 +1,4 @@
-"""設定・アカウントの永続化（ローカルファイル / Vercel KV）."""
+"""設定・アカウントの永続化（ローカルファイル / Vercel Redis）."""
 
 from __future__ import annotations
 
@@ -13,9 +13,23 @@ logger = logging.getLogger(__name__)
 KV_SETTINGS_KEY = "mitene:settings"
 KV_ACCOUNTS_KEY = "mitene:accounts"
 
+_REDIS_ENV_PAIRS = (
+    ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
+    ("KV_REST_API_URL", "KV_REST_API_TOKEN"),
+)
+
+
+def redis_credentials() -> tuple[str, str] | None:
+    for url_key, token_key in _REDIS_ENV_PAIRS:
+        url = (os.getenv(url_key) or "").strip()
+        token = (os.getenv(token_key) or "").strip()
+        if url and token:
+            return url, token
+    return None
+
 
 def kv_available() -> bool:
-    return bool(os.getenv("KV_REST_API_URL") and os.getenv("KV_REST_API_TOKEN"))
+    return redis_credentials() is not None
 
 
 def storage_mode() -> str:
@@ -28,19 +42,53 @@ def storage_mode() -> str:
 def storage_warning() -> str:
     if storage_mode() != "ephemeral":
         return ""
+    hints: list[str] = []
+    for url_key, token_key in _REDIS_ENV_PAIRS:
+        if os.getenv(url_key) and not os.getenv(token_key):
+            hints.append(f"{token_key} が未設定")
+        elif os.getenv(token_key) and not os.getenv(url_key):
+            hints.append(f"{url_key} が未設定")
+    detail = f"（{', '.join(hints)}）" if hints else ""
     return (
         "Vercel の一時領域に保存しているため、再読み込みで登録が消えます。"
-        "Vercel ダッシュボード → Storage → KV を作成し、このプロジェクトに接続して再デプロイしてください。"
+        "Storage で Redis を作成し、このプロジェクトに接続したあと Redeploy してください。"
+        "Settings → Environment Variables に UPSTASH_REDIS_REST_URL / "
+        "UPSTASH_REDIS_REST_TOKEN（または KV_REST_API_URL / KV_REST_API_TOKEN）"
+        f"があるか確認してください。{detail}"
     )
+
+
+def storage_debug() -> dict[str, Any]:
+    creds = redis_credentials()
+    return {
+        "mode": storage_mode(),
+        "vercel": bool(os.getenv("VERCEL")),
+        "redis_configured": creds is not None,
+        "env": {
+            url_key: bool(os.getenv(url_key))
+            for url_key, token_key in _REDIS_ENV_PAIRS
+            for _ in ((),)
+        }
+        | {
+            token_key: bool(os.getenv(token_key))
+            for url_key, token_key in _REDIS_ENV_PAIRS
+        },
+    }
 
 
 def _redis():
     from upstash_redis import Redis
 
-    return Redis(
-        url=os.environ["KV_REST_API_URL"],
-        token=os.environ["KV_REST_API_TOKEN"],
-    )
+    creds = redis_credentials()
+    if creds:
+        return Redis(url=creds[0], token=creds[1])
+    try:
+        return Redis.from_env()
+    except Exception as exc:
+        raise RuntimeError(
+            "Redis 環境変数が見つかりません。"
+            "UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN を設定してください。"
+        ) from exc
 
 
 def _read_local(path: Path) -> dict[str, Any] | None:
@@ -80,7 +128,7 @@ def read_settings(path: Path) -> dict[str, Any] | None:
         try:
             return _read_kv(KV_SETTINGS_KEY)
         except Exception:
-            logger.exception("Vercel KV から settings を読めませんでした")
+            logger.exception("Redis から settings を読めませんでした")
             return None
     return _read_local(path)
 
@@ -91,7 +139,7 @@ def write_settings(path: Path, data: dict[str, Any]) -> None:
         _write_kv(KV_SETTINGS_KEY, data)
         return
     if mode == "ephemeral":
-        logger.warning("Vercel KV 未設定: settings は再起動で消える可能性があります")
+        logger.warning("Redis 未設定: settings は再起動で消える可能性があります")
     _write_local(path, data)
 
 
@@ -101,7 +149,7 @@ def read_accounts(path: Path) -> dict[str, Any] | None:
         try:
             return _read_kv(KV_ACCOUNTS_KEY)
         except Exception:
-            logger.exception("Vercel KV から accounts を読めませんでした")
+            logger.exception("Redis から accounts を読めませんでした")
             return None
     return _read_local(path)
 
@@ -112,5 +160,5 @@ def write_accounts(path: Path, data: dict[str, Any]) -> None:
         _write_kv(KV_ACCOUNTS_KEY, data)
         return
     if mode == "ephemeral":
-        logger.warning("Vercel KV 未設定: accounts は再起動で消える可能性があります")
+        logger.warning("Redis 未設定: accounts は再起動で消える可能性があります")
     _write_local(path, data)
