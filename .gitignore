@@ -1,0 +1,17 @@
+.env
+data/accounts.json
+data/settings.json
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+playwright/.auth/
+logs/
+screenshots/
+*.log
+build/
+dist/
+*.spec.bak
+playwright-browsers/
+.DS_Store
+**/.DS_Store

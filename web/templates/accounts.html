@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block page_title %}女の子ログイン{% endblock %}
+{% block content %}
+{% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
+{% if error %}<div class="flash err">{{ error }}</div>{% endif %}
+
+<section class="card">
+  <h2>共通ログインURL</h2>
+  <form method="post" class="form-grid">
+    <input type="hidden" name="action" value="save_url">
+    <div>
+      <label for="base_url">姫デコ ログインページURL（全員共通）</label>
+      <input type="url" id="base_url" name="base_url" value="{{ settings.base_url }}" placeholder="https://..." required>
+      <p class="hint"><strong>毎回変える必要はありません。</strong> 姫デコの<strong>ログイン画面</strong>のURLを1回登録すればOK（例: <code>https://spgirl.cityheaven.net/J1Login.php</code>）。ログイン後に保存されるセッションで次回以降は自動操作します。<br>避けるもの: アドレスバーに <code>PHPSESSID=</code> が付いたURL（ログイン直後の一時URL）は期限切れになりやすいです。</p>
+    </div>
+    <button type="submit" class="btn-primary" style="width:fit-content">URLを保存</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>女の子を登録・更新</h2>
+  <form method="post" class="form-grid" id="form-account-save">
+    <input type="hidden" name="action" value="save">
+    <input type="hidden" name="account_id" id="account_id" value="">
+    <input type="hidden" name="confirm_duplicate" id="confirm_duplicate" value="0">
+    <div>
+      <label for="name">表示名（管理用）</label>
+      <input type="text" id="name" name="name" placeholder="例: あいり" required>
+    </div>
+    <div>
+      <label for="login_id">女の子ID or メールアドレス</label>
+      <input type="text" id="login_id" name="login_id" required>
+    </div>
+    <div>
+      <label for="password">パスワード（半角英数字4〜12文字）</label>
+      <input type="password" id="password" name="password">
+    </div>
+    <label><input type="checkbox" name="enabled" id="enabled" checked> この女の子を自動送信対象にする</label>
+    <div class="actions-inline">
+      <button type="submit" class="btn-primary">保存</button>
+      <button type="button" class="btn-secondary" id="btn-clear-form">入力をクリア</button>
+    </div>
+  </form>
+</section>
+
+{% set compact = false %}
+{% include "_account_list.html" with context %}
+
+<div id="duplicate-name-modal" class="modal-overlay" hidden aria-hidden="true">
+  <div class="modal-box" role="dialog" aria-labelledby="duplicate-name-title">
+    <p id="duplicate-name-title" class="modal-message">同姓同名が存在します</p>
+    <div class="modal-actions">
+      <button type="button" class="btn-primary" id="btn-dup-confirm">そのまま保存</button>
+      <button type="button" class="btn-secondary" id="btn-dup-cancel">保存せず閉じる</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='account_list.js') }}?v=1"></script>
+<script>
+window.existingAccountsData = [
+  {% for a in accounts %}
+  { id: {{ a.id | tojson }}, name: {{ a.name | tojson }} },
+  {% endfor %}
+];
+
+function normalizeName(value) {
+  return value.trim().replace(/\u3000/g, " ").trim();
+}
+
+function hasDuplicateName(name, excludeId) {
+  const key = normalizeName(name);
+  if (!key) return false;
+  return (window.existingAccountsData || []).some(
+    (a) => a.id !== excludeId && normalizeName(a.name) === key
+  );
+}
+
+const formAccountSave = document.getElementById("form-account-save");
+const duplicateModal = document.getElementById("duplicate-name-modal");
+const confirmDuplicateInput = document.getElementById("confirm_duplicate");
+let skipDuplicateCheck = false;
+
+function openDuplicateModal() {
+  duplicateModal.hidden = false;
+  duplicateModal.setAttribute("aria-hidden", "false");
+}
+
+function closeDuplicateModal() {
+  duplicateModal.hidden = true;
+  duplicateModal.setAttribute("aria-hidden", "true");
+}
+
+formAccountSave.addEventListener("submit", (e) => {
+  window.MiteneSync?.pause(8000);
+  if (skipDuplicateCheck) return;
+  const name = document.getElementById("name").value;
+  const accountId = document.getElementById("account_id").value;
+  if (!hasDuplicateName(name, accountId)) {
+    confirmDuplicateInput.value = "0";
+    return;
+  }
+  e.preventDefault();
+  confirmDuplicateInput.value = "0";
+  openDuplicateModal();
+});
+
+document.getElementById("btn-dup-cancel").onclick = () => {
+  closeDuplicateModal();
+};
+
+document.getElementById("btn-dup-confirm").onclick = () => {
+  closeDuplicateModal();
+  confirmDuplicateInput.value = "1";
+  skipDuplicateCheck = true;
+  formAccountSave.requestSubmit();
+  skipDuplicateCheck = false;
+};
+
+duplicateModal.addEventListener("click", (e) => {
+  if (e.target === duplicateModal) closeDuplicateModal();
+});
+
+document.getElementById("btn-clear-form").onclick = () => {
+  document.getElementById("account_id").value = "";
+  document.getElementById("name").value = "";
+  document.getElementById("login_id").value = "";
+  document.getElementById("password").value = "";
+  document.getElementById("enabled").checked = true;
+  confirmDuplicateInput.value = "0";
+};
+</script>
+{% endblock %}

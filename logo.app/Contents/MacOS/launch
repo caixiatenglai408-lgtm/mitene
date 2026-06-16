@@ -1,0 +1,9 @@
+#!/bin/bash
+PROJECT_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$PROJECT_ROOT"
+
+if [ ! -d ".venv" ]; then
+  osascript -e 'display notification "初回セットアップを開始します" with title "ミテネ自動送信"'
+fi
+
+exec "$PROJECT_ROOT/.venv/bin/python" "$PROJECT_ROOT/launch_app.py" 2>>"$PROJECT_ROOT/logs/app.log"

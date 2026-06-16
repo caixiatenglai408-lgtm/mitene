@@ -1,0 +1,41 @@
+---
+description: 姫デコミテネ自動送信の動作確認済みロジック（2026-06-05）。変更時はこの経路を壊さない。
+globs: src/mitene_sender.py,config.yaml,src/runner.py,src/human_behavior.py
+alwaysApply: false
+---
+
+# ミテネ送信（動作確認済み）
+
+`SEND_LOGIC_VERSION = "cta-click-modal-confirm"`（`src/mitene_sender.py`）
+
+## 正しいフロー
+
+1. 女の子ログイン → ホームで **ミテネ残り回数** 取得
+2. **「ミテネできる会員を探す」** → `J10ComeonVisitorList.php?gid=...` 会員一覧
+3. `comeon-{会員ID}` キューで **残り回数ぶん** 送信（`priority_steps: []` の単一路線）
+4. 成功ログ: `送信成功 comeon-xxx（残り N → N-1）` / `1件送信完了（k / 目標）`
+
+## 1人あたりの実装（必須）
+
+- CTA: `_tap_mitene_cta` → Playwright `click` → DOM `a.click()` → `registComeon(id)` の順
+- 確認: `#colorbox` 等を `_wait_confirm_layer` で待ってから `_confirm_send_dialog`
+- **モーダル内の `.kitene_send_btn` / `ミテネを送る` は押す**（確認も同クラス）
+- 一覧の会員カードだけ除外: `.user_ranking_box` / `.user_ranking_list`
+- `page.on("dialog")` でネイティブ `confirm()` を accept
+- 成功判定: **残り回数の減少** を最優先、補助で `_wait_kitene_send_result`
+- 会員間待機: `between_members_ms: [800, 1200]`（0.8〜1.2秒、`human_behavior` のログ「次のミテネまで」）
+
+## やってはいけない（過去に全滅したパターン）
+
+- 確認クリックで **モーダル内の `.kitene_send_btn` を一律スキップ**（残り 19→19 の原因）
+- `registComeon` のみ / `force=True` のみで確認なし
+- ボタン **index キュー**（送信後に DOM がずれる）
+- ホームを飛ばしてタブ URL 直打ちだけ（`priority_steps` あり時のフォールバック以外）
+- `networkidle` 長待ち、失敗会員の同一実行内リトライ
+
+## 設定の既定（`config.yaml`）
+
+- `priority_steps: []`, `must_use_full_budget: false`, `fast_send: true`
+- `confirm_buttons`: ミテネを送る → 送る → OK
+
+UI文言（手動実行の2行説明・ヘッダー）はユーザー指定があるまで勝手に変えない。

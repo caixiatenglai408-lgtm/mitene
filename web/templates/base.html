@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#e91e8c">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="ミテネ送信">
+  <title>姫デコ-{% block page_title %}ミテネ自動送信{% endblock %}</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+  <link rel="icon" href="{{ url_for('static', filename='icons/deco-app-icon-512.png') }}" type="image/png" sizes="512x512">
+  <link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/deco-app-icon-1024.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=17">
+</head>
+<body data-page="{{ request.endpoint or '' }}">
+  <div class="wrap">
+    <header>
+      <h1>姫デコ ミテネ！自動送信</h1>
+      <p class="header-meta">
+        <span class="header-remaining">ミテネ残り回数を全て使い切るまで送信</span>
+      </p>
+    </header>
+    <nav class="nav-bar">
+      <div class="nav-links">
+        <a href="{{ url_for('index') }}" class="{% if request.endpoint == 'index' %}active{% endif %}">設定</a>
+        <a href="{{ url_for('accounts') }}" class="{% if request.endpoint == 'accounts' %}active{% endif %}">女の子ログイン</a>
+      </div>
+      <span id="sync-indicator" class="sync-indicator" title="3分おきに自動で最新状態に更新します"></span>
+    </nav>
+    {% block content %}{% endblock %}
+  </div>
+  <script src="{{ url_for('static', filename='sync.js') }}?v=1"></script>
+  {% if mitene_auto_exit %}
+  <script src="{{ url_for('static', filename='browser_exit.js') }}?v=2"></script>
+  {% endif %}
+  {% block scripts %}{% endblock %}
+</body>
+</html>

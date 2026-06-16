@@ -1,0 +1,85 @@
+# 姫デコ ミテネ！自動送信
+
+flow: standard
+
+mitene:
+  find_members_button: "ミテネできる会員を探す"
+  remaining_label: "ミテネ残り回数"
+  mitene_history_label: "ミテネ履歴"
+  max_send_per_run: 0
+  must_use_full_budget: false  # 送れる分だけ送る（サイト拒否時に0件で止めない）
+  max_scroll_rounds: 30
+  member_cooldown_days: 10  # 同一会員への再送間隔（候補不足時は無視）
+  max_no_history_sends_per_day: 6  # 履歴なし会員への1日上限（候補不足時は無視）
+  # 送信順（gid=女の子ID。新規=kitene_question「ミテネ履歴」に「送信済」なし）
+  priority_steps:
+    # ① マイガール（新規会員を最優先）
+    - tab: マイガール
+      member_filter: new_only
+      list_path: /J10ComeonMyGirlList.php
+    # ② キープ（新規会員）
+    - tab: キープ
+      member_filter: new_only
+      list_path: /J10ComeonKeepList.php
+    # ③ マッチ率（新規会員・残りミテネ回数ぶん）
+    - tab: マッチ率
+      member_filter: new_only
+      list_path: /J10ComeonAiMatchingList.php
+    # ④ みたよ（③で新規0件のときのみ）
+    - tab: みたよ
+      condition: if_no_match_new
+      member_filter: sendable
+      list_path: /J10ComeonVisitorList.php
+    # ⑤ マイガール（送信日が古い順・同日はランダム）
+    # ※①〜④で新規が1人もいない場合は⑤をスキップし、
+    #   全タブ合算→送信日古い順のフォールバックへ
+    - tab: マイガール
+      member_filter: sent_oldest_first
+      list_path: /J10ComeonMyGirlList.php
+  confirm_buttons:
+    - "ミテネを送る"
+    - "送る"
+    - "OK"
+  skip_special_banners: true
+
+# 待機時間（ミテネを押す間隔だけ手動風・それ以外は短めでOK）
+human:
+  enabled: true
+  fast_send: true   # クリック処理のみ短縮（会員間の待ちは between_members_ms）
+  typing_delay_ms: [40, 120]
+  action_delay_ms: [150, 350]
+  between_members_ms: [800, 1200]   # ミテネを送る間隔（0.8〜1.2秒）
+  between_accounts_ms: [60000, 120000]
+  tab_switch_delay_ms: [400, 800]
+  after_login_delay_ms: [800, 1500]
+  after_send_delay_ms: [80, 200]
+  scroll_probability: 0
+  idle_pause_probability: 0
+  idle_pause_ms: [300, 600]
+  shuffle_member_order: false
+  shuffle_account_order: true
+
+mitene_gift:
+  menu_button_text: "ミテネギフトを送る"
+  image_index: 0
+  image_alt: ""
+  user_selection: unsent_only
+  message: "お待ちしてます！"
+
+login:
+  id_placeholder: "女の子ID or メールアドレス"
+  password_placeholder: "半角英数字4〜12文字"
+  submit_text: "ログイン"
+
+browser:
+  headless: true
+  slow_mo_ms: 0
+  timeout_ms: 45000
+  viewport:
+    width: 390
+    height: 844
+    is_mobile: true
+
+logging:
+  dir: logs
+  screenshot_on_error: true

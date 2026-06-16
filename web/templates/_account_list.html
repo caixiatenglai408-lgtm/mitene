@@ -1,0 +1,60 @@
+<section class="card" id="account-list-section">
+  <h2 id="account-list-title">登録一覧（{{ accounts|length }}名）</h2>
+  {% if compact %}
+  <p class="hint">
+    登録・編集は <a href="{{ url_for('accounts') }}">女の子ログイン</a> から行えます。
+  </p>
+  {% else %}
+  <p class="hint">「自動送信対象外にする」で一覧に残したまま送信だけ止められます。消す場合は「削除」</p>
+  {% endif %}
+  {% if not compact %}
+  <div class="account-search">
+    <label for="account-name-search">名前で検索</label>
+    <div class="account-search-field">
+      <input
+        type="text"
+        id="account-name-search"
+        class="account-search-input"
+        placeholder="表示名を入力"
+        autocomplete="off"
+      >
+      <button type="button" id="btn-account-search" class="account-search-btn" aria-label="検索">
+        <svg class="account-search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/>
+          <path d="M20 20L16 16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+  {% endif %}
+  <p id="account-list-empty" class="hint" {% if accounts %}hidden{% endif %}>まだ登録がありません。{% if compact %}<a href="{{ url_for('accounts') }}">女の子ログイン</a>から追加してください。{% else %}上のフォームから追加してください。{% endif %}</p>
+  {% if not compact %}
+  <p id="account-search-result" class="account-search-result" hidden></p>
+  {% endif %}
+  <ul class="account-list" id="account-list">
+    {% for a in accounts %}
+    <li class="account-card" data-account-id="{{ a.id }}" data-account-name="{{ a.name }}">
+      <div class="account-card-main">
+        <strong class="account-name">{{ a.name }}</strong>
+        <span class="hint account-meta">{{ a.login_id }}{% if not a.enabled %} · 自動送信対象外{% endif %}</span>
+        <div class="actions-inline actions-main">
+          {% if not compact %}
+          <button type="button" class="btn-secondary btn-edit" data-id="{{ a.id }}" data-name="{{ a.name }}" data-login="{{ a.login_id }}" data-enabled="{{ 'true' if a.enabled else 'false' }}">編集</button>
+          {% endif %}
+          <button type="button" class="btn-primary btn-run" data-id="{{ a.id }}" data-name="{{ a.name }}">今すぐ送信</button>
+          <button
+            type="button"
+            class="btn-toggle-auto{% if not a.enabled %} btn-toggle-auto-off{% endif %}"
+            data-id="{{ a.id }}"
+            data-name="{{ a.name }}"
+            data-enabled="{{ 'true' if a.enabled else 'false' }}"
+          >{% if a.enabled %}自動送信対象外にする{% else %}自動送信対象にする{% endif %}</button>
+          {% if not compact %}
+          <button type="button" class="btn-danger btn-delete-account" data-id="{{ a.id }}" data-name="{{ a.name }}">削除</button>
+          {% endif %}
+        </div>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+</section>

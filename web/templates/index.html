@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+{% block page_title %}設定{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>自動送信 ON / OFF</h2>
+  <p>
+    現在:
+    <span id="automation-badge" class="status-badge {% if settings.automation_enabled %}on{% else %}off{% endif %}">
+      {% if settings.automation_enabled %}ON{% else %}OFF{% endif %}
+    </span>
+  </p>
+  <p class="hint">半自動運用では「今すぐ全員送信」または各女の子の「今すぐ送信」を使います。OFF にしても手動送信はできます。</p>
+  <div class="cta-row" style="margin-top:14px">
+    <button type="button" id="btn-automation-on" class="cta cta-on {% if settings.automation_enabled %}active{% endif %}">
+      自動送信 ON
+    </button>
+    <button type="button" id="btn-automation-off" class="cta cta-off {% if not settings.automation_enabled %}active{% endif %}">
+      自動送信 OFF
+    </button>
+  </div>
+  <div id="auto-run-result" class="run-result-detail" hidden></div>
+</section>
+
+{% set enabled_accounts = accounts | selectattr('enabled') | list %}
+<section class="card">
+  <h2>手動実行</h2>
+  <p class="hint">
+    自動送信対象 <strong id="enabled-count-hint">{{ enabled_accounts | length }}</strong> 名
+    （登録 <span id="accounts-count-hint">{{ accounts|length }}</span> 名）
+  </p>
+  <div class="cta-row">
+    <button type="button" id="btn-run-all" class="btn-primary">今すぐ全員送信</button>
+    <button type="button" id="btn-dry-all" class="btn-secondary">全員ドライラン（送信しない）</button>
+  </div>
+  <div id="run-status" class="run-status" hidden></div>
+  <div id="manual-run-result" class="run-result-detail" hidden></div>
+</section>
+
+{% set compact = true %}
+{% include "_account_list.html" with context %}
+{% endblock %}
+
+{% block scripts %}
+<script>document.body.dataset.accountListCompact = "1";</script>
+<script src="{{ url_for('static', filename='run_results.js') }}?v=1"></script>
+<script src="{{ url_for('static', filename='run_ui.js') }}?v=1"></script>
+<script src="{{ url_for('static', filename='account_list.js') }}?v=2"></script>
+<script>
+async function postJson(url, body) {
+  window.MiteneSync?.pause(6000);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `エラー (${res.status})`);
+  }
+  return data;
+}
+
+function setAutomation(enabled) {
+  postJson("/api/automation", { enabled }).then((data) => {
+    const badge = document.getElementById("automation-badge");
+    const onBtn = document.getElementById("btn-automation-on");
+    const offBtn = document.getElementById("btn-automation-off");
+    if (data.automation_enabled) {
+      badge.textContent = "ON";
+      badge.className = "status-badge on";
+      onBtn.classList.add("active");
+      offBtn.classList.remove("active");
+    } else {
+      badge.textContent = "OFF";
+      badge.className = "status-badge off";
+      offBtn.classList.add("active");
+      onBtn.classList.remove("active");
+    }
+  }).catch((e) => alert(e.message));
+}
+
+document.getElementById("btn-automation-on").onclick = () => setAutomation(true);
+document.getElementById("btn-automation-off").onclick = () => setAutomation(false);
+
+function renderManualRunDisplay(display) {
+  window.MiteneRunUI?.renderManualResult(display, "手動実行の結果");
+}
+
+async function pollJob(jobId) {
+  const res = await fetch(`/api/jobs/${jobId}`);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "ジョブ取得失敗");
+  return data.job;
+}
+
+async function runAll(dryRun) {
+  const ui = window.MiteneRunUI;
+  const label = dryRun ? "全員ドライラン" : "今すぐ全員送信";
+  const n = document.getElementById("enabled-count-hint")?.textContent?.trim() || "?";
+  if (!dryRun && !confirm(
+    `${label}を開始しますか？\n\n・自動送信対象の女の子 ${n} 名を順番に処理\n・1人あたり「ミテネ残り回数」ぶん、全て使い切るまで送信\n・10日以内に送った会員は除外（候補不足時は除く）\n・対象外にした女の子はスキップ`
+  )) {
+    return;
+  }
+
+  ui?.clearManualResult();
+  let stopElapsed = ui?.createElapsedTicker((sec) => {
+    ui.setRunStatus({
+      running: true,
+      message: dryRun ? "ドライラン実行中…" : "全員送信中…",
+      elapsedSec: sec,
+    });
+  });
+
+  try {
+    const url = dryRun ? "/api/run-dry-all" : "/api/run-now";
+    const start = await postJson(url, { manual: true });
+    const jobId = start.job_id;
+    const startedAt = Date.now();
+    const maxWaitMs = 22 * 60 * 1000;
+
+    const timer = setInterval(async () => {
+      try {
+        const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+        const job = await pollJob(jobId);
+
+        if (job.status === "running") {
+          ui?.setRunStatus({
+            running: true,
+            message: dryRun ? "ドライラン実行中…" : "全員送信中…",
+            elapsedSec: elapsed,
+          });
+          if (Date.now() - startedAt > maxWaitMs) {
+            clearInterval(timer);
+            stopElapsed?.();
+            ui?.setRunStatus({
+              running: false,
+              isError: true,
+              message: "応答がありません。起動.command を再起動してログを確認してください。",
+            });
+          }
+          return;
+        }
+
+        clearInterval(timer);
+        stopElapsed?.();
+
+        if (job.status === "done") {
+          const display = job.display || null;
+          const hasIssues = display ? !!display.has_issues : false;
+          ui?.setRunStatus({
+            running: false,
+            phase: "done",
+            isError: hasIssues,
+            message: job.message || "処理が終わりました",
+          });
+          if (display) renderManualRunDisplay(display);
+        } else if (job.status === "error") {
+          ui?.setRunStatus({
+            running: false,
+            isError: true,
+            message: job.error || "送信に失敗しました",
+          });
+        }
+      } catch (e) {
+        clearInterval(timer);
+        stopElapsed?.();
+        ui?.setRunStatus({
+          running: false,
+          isError: true,
+          message: e.message,
+        });
+      }
+    }, 2000);
+  } catch (e) {
+    stopElapsed?.();
+    ui?.setRunStatus({
+      running: false,
+      isError: true,
+      message: e.message,
+    });
+  }
+}
+
+document.getElementById("btn-run-all").onclick = () => runAll(false);
+document.getElementById("btn-dry-all").onclick = () => runAll(true);
+</script>
+{% endblock %}

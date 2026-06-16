@@ -1,0 +1,9 @@
+#!/bin/bash
+PROJECT_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+CMD="$PROJECT_ROOT/ブラウザで開く.command"
+if [ ! -f "$CMD" ]; then
+  osascript -e 'display alert "ブラウザで開く.command が見つかりません。プロジェクトフォルダを移動していないか確認してください。" as critical'
+  exit 1
+fi
+xattr -d com.apple.quarantine "$CMD" 2>/dev/null || true
+open -a Terminal "$CMD"

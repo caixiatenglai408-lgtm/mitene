@@ -1,0 +1,2 @@
+# Windows .exe ビルド用（配布先 PC には不要）
+pyinstaller>=6.3.0

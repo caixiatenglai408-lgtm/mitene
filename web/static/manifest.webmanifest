@@ -1,0 +1,26 @@
+{
+  "name": "ミテネ自動送信",
+  "short_name": "ミテネ送信",
+  "description": "姫デコ ミテネ！自動送信の管理画面",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#faf8f9",
+  "theme_color": "#e54545",
+  "lang": "ja",
+  "icons": [
+    {
+      "src": "/static/icons/deco-app-icon-1024.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icons/deco-app-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
