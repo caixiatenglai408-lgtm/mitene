@@ -12,6 +12,10 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def is_vercel() -> bool:
+    return bool(os.getenv("VERCEL"))
+
+
 def app_root() -> Path:
     """設定・data・logs を置くルート（exe と同じフォルダ）."""
     if is_frozen():
@@ -26,8 +30,18 @@ def bundle_root() -> Path:
     return app_root()
 
 
+def data_root() -> Path:
+    """書き込み可能なデータ置き場（Vercel は /tmp のみ可）."""
+    if is_vercel():
+        root = Path("/tmp/mitene-autosend")
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    return app_root()
+
+
 APP_ROOT = app_root()
 BUNDLE_ROOT = bundle_root()
+DATA_ROOT = data_root()
 
 
 def playwright_browsers_dir() -> Path:
@@ -36,6 +50,15 @@ def playwright_browsers_dir() -> Path:
 
 def setup_runtime() -> None:
     """起動時の環境変数・フォルダを整える."""
+    if is_vercel():
+        os.environ.setdefault(
+            "PLAYWRIGHT_BROWSERS_PATH",
+            str(Path("/tmp/playwright-browsers")),
+        )
+        for rel in ("data", "logs", "playwright/.auth"):
+            (DATA_ROOT / rel).mkdir(parents=True, exist_ok=True)
+        return
+
     os.environ.setdefault(
         "PLAYWRIGHT_BROWSERS_PATH",
         str(playwright_browsers_dir()),

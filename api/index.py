@@ -1,8 +1,16 @@
-"""Vercel entrypoint.
+"""Vercel entrypoint for the Flask dashboard."""
 
-Vercel's Python runtime serves WSGI apps exported as `app`.
-We reuse the existing Flask dashboard defined in `web/app.py`.
-"""
+from __future__ import annotations
 
-from web.app import app  # noqa: F401
+import sys
+from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+_SRC = ROOT / "src"
+
+for path in (ROOT, _SRC):
+    text = str(path)
+    if text not in sys.path:
+        sys.path.insert(0, text)
+
+from web.app import app  # noqa: E402

@@ -1,10 +1,13 @@
 {
-  "version": 2,
-  "builds": [
-    { "src": "api/index.py", "use": "@vercel/python" }
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "pip install -r requirements-vercel.txt",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index" }
   ],
-  "routes": [
-    { "src": "/(.*)", "dest": "api/index.py" }
-  ]
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{.venv/**,playwright-browsers/**,dist/**,build/**,logs/**,screenshots/**,**/*.pyc}"
+    }
+  }
 }
-

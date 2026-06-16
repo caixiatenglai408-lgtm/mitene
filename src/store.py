@@ -12,11 +12,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app_paths import APP_ROOT
+from app_paths import APP_ROOT, DATA_ROOT
 from crypto_util import decrypt_secret, encrypt_secret
 
 ROOT = APP_ROOT
-DATA_DIR = ROOT / "data"
+DATA_DIR = DATA_ROOT / "data"
 ACCOUNTS_PATH = DATA_DIR / "accounts.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 

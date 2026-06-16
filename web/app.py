@@ -53,14 +53,19 @@ from store import (  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
+_WEB_DIR = Path(__file__).resolve().parent
 if is_frozen():
-    app = Flask(
-        __name__,
-        template_folder=str(BUNDLE_ROOT / "web" / "templates"),
-        static_folder=str(BUNDLE_ROOT / "web" / "static"),
-    )
+    _template_dir = BUNDLE_ROOT / "web" / "templates"
+    _static_dir = BUNDLE_ROOT / "web" / "static"
 else:
-    app = Flask(__name__, template_folder="templates", static_folder="static")
+    _template_dir = _WEB_DIR / "templates"
+    _static_dir = _WEB_DIR / "static"
+
+app = Flask(
+    __name__,
+    template_folder=str(_template_dir),
+    static_folder=str(_static_dir),
+)
 app.secret_key = __import__("os").getenv("FLASK_SECRET_KEY", "mitene-local-dev-key")
 logging.basicConfig(level=logging.INFO)
 
