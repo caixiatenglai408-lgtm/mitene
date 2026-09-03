@@ -1,41 +1,88 @@
 ---
-description: 姫デコミテネ自動送信の動作確認済みロジック（2026-06-05）。変更時はこの経路を壊さない。
-globs: src/mitene_sender.py,config.yaml,src/runner.py,src/human_behavior.py
+description: 姫デコ ミテネ自動送信の「現在動作している送信経路」（baseline 2026-07-12 / Phase 1 で確認）。この経路の挙動を変える変更は必ず事前確認すること。
+globs: src/mitene_sender.py,src/runner.py,src/scheduler_service.py,src/job_runner.py,src/result_display.py,config.yaml,src/human_behavior.py
 alwaysApply: false
 ---
 
-# ミテネ送信（動作確認済み）
+# ミテネ送信（現行 baseline）
 
-`SEND_LOGIC_VERSION = "cta-click-modal-confirm"`（`src/mitene_sender.py`）
+- 第一参照資料は **`docs/current_baseline.md`**。本ファイルはその要約。
+- **README・過去の会話・古いコメントより、実行コードを正とする。**
+- `SEND_LOGIC_VERSION = "cta-click-modal-confirm"`（`src/mitene_sender.py`）。
 
-## 正しいフロー
+## 現行経路（config.yaml は `flow: standard` / `priority_steps` 7件）
 
-1. 女の子ログイン → ホームで **ミテネ残り回数** 取得
-2. **「ミテネできる会員を探す」** → `J10ComeonVisitorList.php?gid=...` 会員一覧
-3. `comeon-{会員ID}` キューで **残り回数ぶん** 送信（`priority_steps: []` の単一路線）
-4. 成功ログ: `送信成功 comeon-xxx（残り N → N-1）` / `1件送信完了（k / 目標）`
+1. ログイン（`_ensure_logged_in` → `J1Login.php`、最大3回）
+2. ホームで **ミテネ残り回数** を取得 → `_read_send_budget()` が `budget` を確定し `_locked_send_budget` に固定（実行中は再取得しても同値）。`max_send_per_run: 0` なので **budget = 残り回数そのもの**。
+3. **`_execute_phased_send_pipeline()`** が下記 7 フェーズを順に実行（`_send_mitene_standard` 内、`if steps:` が真のとき＝現行）。
+4. 各フェーズ: `_fetch_tab_members()`（J10一覧URL直打ち → スクロール走査 → `collect_members`）→ `_apply_step_member_filter()` → `_send_member_keys_phase()` → `_send_loop_for_step()` → `_send_one_mitene()`。
+5. `sent >= budget` になった時点で以降のフェーズは全スキップ。
 
-## 1人あたりの実装（必須）
+### 7 フェーズ（順序は `_execute_phased_send_pipeline` にハードコード）
 
-- CTA: `_tap_mitene_cta` → Playwright `click` → DOM `a.click()` → `registComeon(id)` の順
-- 確認: `#colorbox` 等を `_wait_confirm_layer` で待ってから `_confirm_send_dialog`
-- **モーダル内の `.kitene_send_btn` / `ミテネを送る` は押す**（確認も同クラス）
-- 一覧の会員カードだけ除外: `.user_ranking_box` / `.user_ranking_list`
-- `page.on("dialog")` でネイティブ `confirm()` を accept
-- 成功判定: **残り回数の減少** を最優先、補助で `_wait_kitene_send_result`
-- 会員間待機: `between_members_ms: [800, 1200]`（0.8〜1.2秒、`human_behavior` のログ「次のミテネまで」）
+| # | タブ | list_path | member_filter | 実行条件 |
+|---|---|---|---|---|
+| ① | マイガール | `/J10ComeonMyGirlList.php` | `new_only` | 常時 |
+| ② | キープ | `/J10ComeonKeepList.php` | `new_only` | 常時 |
+| ③ | マッチ率 | `/J10ComeonAiMatchingList.php` | `new_only` | 常時（新規有無を `_match_rate_had_new` に記録） |
+| ④ | マイガール | 同上 | `sent_oldest_first` | 常時 |
+| ⑤ | みたよ | `/J10ComeonVisitorList.php` | `sendable` | **③で新規マッチ率が0件のときのみ** |
+| ⑥ | キープ | 同上 | `sent_oldest_first` | 常時（`_send_oldest_first_phases`） |
+| ⑦ | マッチ率 | 同上 | `sent_oldest_first` | 常時（同上） |
+
+- `new_only`: `has_send_button` かつ「ミテネ履歴」に「送信済」が無い（`is_new_member_from_history`）。
+- `sent_oldest_first`: `has_send_button` かつ送信履歴あり → `_sort_members_oldest_first`（最終送信日 昇順・同日ランダム・日付不明は 1970-01-01 扱い）。
+- `sendable`: `has_send_button` のみ。
+- どのフィルタでも「今回すでに `comeon-{id}` が `_sent_member_keys` / `_failed_member_keys` に入っている会員」は除外。**同一実行内で再送・失敗リトライしない。**
+
+### config.yaml と実処理の関係（重要・Phase 1 未統合）
+
+`config.yaml` の `mitene.priority_steps`（7件）は **`_send_mitene_standard` の `if steps:` を真にするためだけ**に使われ、巡回順・`condition`・`sub_tab`・`max_members` は `_execute_phased_send_pipeline` のハードコードが優先する。**config はステップ内容の完全な制御元ではない。** 統合は将来 Phase の課題（Phase 1 では変更しない）。
+
+## 1 人あたりの実装（`_send_one_mitene`・必須）
+
+- CTA: `_tap_mitene_cta` → ① Playwright `click(timeout=12000)` → ② カード内 `a`/`button` の DOM `el.click()` → ③ `registComeon(Number(mid))` の順。
+- 確認: `_wait_confirm_layer`（`#colorbox` 等 visible・最大4000ms）→ `_confirm_send_dialog`（`_click_overlay_confirm` → `_click_confirm_in_modal`）。
+- `confirm_buttons`: `ミテネを送る` → `送る` → `OK`（＋内部で「送信」「はい」）。
+- 一覧の会員カード（`.user_ranking_box` / `.user_ranking_list` 内）は確認クリック対象から除外。モーダル内の `.kitene_send_btn` は押す。
+- `page.on("dialog")` でネイティブ `confirm()` は accept（`_attach_page_handlers`）。
+- **成功判定（OR・優先順）**:
+  1. `remaining_before` と `remaining_after` が両方数値で `remaining_after < remaining_before`（残り回数が減った＝最優先）。
+  2. `_wait_kitene_send_result()` が True（対象ボタンが「送信済」表示 / `.kitene_send_zumi_btn` 表示 / `active` クラス消失）。
+  - `cta_ok` / `modal_shown` / `ok_clicked` は判定に使わない（デバッグログ用）。
+- 成功時のみ `_mark_member_sent(key)` → `_sent_member_keys.add(key)` ＋（非dry_run）`logs/{id}/member_sends.jsonl` 追記 → `_ensure_member_list_page()`。
+- 失敗時 `_register_failed_member_key(key)` → そのフェーズ内で次の会員へ。
+
+## 送信件数・結果補正（`runner.py`・維持）
+
+- `run()` は int `sent` を返す。`run_for_account` が `status` を決定:
+  `success`(sent>0) / `zero_send`(sent==0) / `no_remaining`(`DailyLimitReached`) / `budget_read_failed`(`RuntimeError` に「ミテネ残り回数取得失敗」) / `error` / `dry_run` / `skipped`。
+- **`resolve_sent_this_run(sender)`**: 例外・`DailyLimitReached` 時に `sender._last_run_report["sent"]`（無ければ `len(sender._sent_member_keys)`）を実績として拾い、`_account_error_result` が **`ok=True / status="success" / sent=N`** に補正する。この補正は削除・変更しない。
+- UI 表示は `result_display.classify_result` / `build_run_display` → `run_poll.js` / `run_ui.js` / `run_results.js`。`completed` に載るのは `success` / `no_remaining` / `dry_run`。`zero_send` は `ok=True` でも `errors` 側。
 
 ## やってはいけない（過去に全滅したパターン）
 
-- 確認クリックで **モーダル内の `.kitene_send_btn` を一律スキップ**（残り 19→19 の原因）
-- `registComeon` のみ / `force=True` のみで確認なし
-- ボタン **index キュー**（送信後に DOM がずれる）
-- ホームを飛ばしてタブ URL 直打ちだけ（`priority_steps` あり時のフォールバック以外）
-- `networkidle` 長待ち、失敗会員の同一実行内リトライ
+- 確認クリックでモーダル内の `.kitene_send_btn` を一律スキップ（残り 19→19 の原因）。
+- `registComeon` だけ / `force=True` だけで確認なし送信。
+- ボタンの index キュー（送信後に DOM がずれる）。現行は `comeon-{会員ID}` キー。
+- ホームを飛ばしてタブURL直打ちだけ（`priority_steps` 経路のフォールバック以外）。
+- `networkidle` 長待ち、失敗会員の同一実行内リトライ。
 
-## 設定の既定（`config.yaml`）
+## 現行 config.yaml の主な有効値（変更は要事前確認）
 
-- `priority_steps: []`, `must_use_full_budget: false`, `fast_send: true`
-- `confirm_buttons`: ミテネを送る → 送る → OK
+- `flow: standard` / `priority_steps`: 7件（上表）/ `must_use_full_budget: false`（送れた分で正常終了）/ `max_send_per_run: 0`
+- `human.fast_send: true`
+- `human.between_members_ms: [300, 500]`（会員間 0.3〜0.5秒）
+- `human.between_accounts_ms: [3000, 5000]`（アカウント間 3〜5秒）
+- `human.shuffle_member_order: false` / `shuffle_account_order: true`
+- `browser.headless: true` / `timeout_ms: 45000`
+- `member_cooldown_days: 0` / `max_no_history_sends_per_day: 0`（現行パイプライン経路では未評価）
 
-UI文言（手動実行の2行説明・ヘッダー）はユーザー指定があるまで勝手に変えない。
+## 未使用・別環境（現行ローカル運用では通らない）
+
+- レガシー単一路線 = `_send_mitene_standard` の `else` 節（`priority_steps` を手で空にしたときのみ）。「送信ループ中に残り回数0を見て break」する処理はここだけ。
+- `worker/`・`src/worker_client.py`・`api/index.py`（Railway/Vercel 構成用。`MITENE_WORKER_URL` / `VERCEL` 未設定なら不使用）。**別環境用のため Phase 1 で削除しない。**
+- `flow: "gift"` 一式（`_send_mitene_gift` ほか）。
+- `src/main.py`（CLI 単体・`HIMEDECO_*` 前提）。
+
+UI 文言（手動実行の説明・ヘッダー）はユーザー指定があるまで勝手に変えない。

@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, render_template, request, url_for
+from flask import Flask, jsonify, render_template, request
 
 _src = Path(__file__).resolve().parent.parent / "src"
 if _src.exists():
@@ -31,14 +31,16 @@ except ImportError:
 ROOT = APP_ROOT
 setup_runtime()
 
-from job_runner import get_job, is_system_busy, run_with_busy_guard, start_background_job, validate_before_run  # noqa: E402
+from job_runner import get_job, is_system_busy, start_background_job, validate_before_run  # noqa: E402
 from runner import run_for_account  # noqa: E402
-from scheduler_service import run_all_scheduled, start_scheduler  # noqa: E402
+from scheduler_service import run_manual_batch, run_single_account, start_scheduler  # noqa: E402
 from store import (  # noqa: E402
     JST,
-    WEEKDAY_LABELS,
-    WEEKDAYS,
-    slots_for_template,
+    attendance_today_label,
+    load_working_today_ids,
+    partition_enabled_by_attendance,
+    reset_working_today,
+    set_account_working_today,
     delete_account,
     get_account,
     has_duplicate_name,
@@ -99,14 +101,49 @@ def _remove_client_tab(tab_id: str) -> None:
         _client_tabs.pop(tab_id, None)
 
 
+def _use_worker() -> bool:
+    from worker_client import worker_enabled
+
+    return worker_enabled()
+
+
+def _worker_required_error() -> str:
+    return (
+        "Vercel から送信するには送信ワーカー（Railway 等）の設定が必要です。"
+        "MITENE_WORKER_URL を Vercel の Environment Variables に追加してください。"
+        "手順は README の「Vercel + 送信ワーカー」を参照してください。"
+    )
+
+
+def _combined_system_busy() -> bool:
+    """UI プロセスと送信ワーカー双方の実行中状態."""
+    if is_system_busy():
+        return True
+    if not _use_worker():
+        return False
+    try:
+        from worker_client import worker_system_busy
+
+        return worker_system_busy()
+    except Exception:
+        logging.exception("送信ワーカーの busy 取得に失敗")
+        return True
+
+
 @app.context_processor
 def inject_ui_config():
+    from app_paths import is_vercel
     from data_store import storage_mode, storage_warning
+    from worker_client import worker_enabled
 
+    vercel_send_warning = ""
+    if is_vercel() and not worker_enabled():
+        vercel_send_warning = _worker_required_error()
     return {
         "mitene_auto_exit": _auto_exit_enabled(),
         "storage_mode": storage_mode(),
         "storage_warning": storage_warning(),
+        "vercel_send_warning": vercel_send_warning,
     }
 
 
@@ -124,10 +161,15 @@ def portal_preview():
 @app.route("/")
 def index():
     settings = load_settings()
+    working_today, off_today = partition_enabled_by_attendance()
     return render_template(
         "index.html",
         settings=settings,
         accounts=load_accounts(),
+        working_today=working_today,
+        off_today=off_today,
+        attendance_label=attendance_today_label(),
+        working_today_ids=load_working_today_ids(),
     )
 
 
@@ -221,19 +263,44 @@ def api_schedule_toggle():
 
 @app.post("/api/run-now")
 def api_run_now():
-    err = validate_before_run()
+    data = request.json or {}
+    group = str(data.get("group") or "all")
+    if group not in ("all", "working", "off"):
+        return jsonify({"ok": False, "error": "group は all / working / off です"}), 400
+    err = validate_before_run(group)
     if err:
         return jsonify({"ok": False, "error": err}), 400
-    job_id = start_background_job(
-        "今すぐ全員送信",
-        lambda: run_all_scheduled(
-            force=True, dry_run=False, require_automation=False
-        ),
-    )
+    job_names = {
+        "all": "今すぐ全員送信",
+        "working": "本日出勤の女の子を送信",
+        "off": "お休みの女の子を送信",
+    }
+    job_name = job_names[group]
+    if _use_worker():
+        try:
+            from worker_client import worker_start_job
+
+            job_id = worker_start_job(job_name, dry_run=False, group=group)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    else:
+        if os.getenv("VERCEL"):
+            return jsonify({"ok": False, "error": _worker_required_error()}), 400
+        job_id = start_background_job(
+            job_name,
+            lambda jid, g=group: run_manual_batch(
+                group=g, dry_run=False, job_id=jid
+            ),
+            dry_run=False,
+            job_type="batch",
+            group=group,
+        )
     return jsonify(
         {
             "ok": True,
             "job_id": job_id,
+            "job_type": "batch",
+            "group": group,
             "message": "送信を開始しました。完了まで数分〜数十分かかることがあります。",
         }
     )
@@ -241,15 +308,38 @@ def api_run_now():
 
 @app.post("/api/run-dry-all")
 def api_run_dry_all():
-    err = validate_before_run()
+    data = request.json or {}
+    group = str(data.get("group") or "all")
+    if group not in ("all", "working", "off"):
+        return jsonify({"ok": False, "error": "group は all / working / off です"}), 400
+    err = validate_before_run(group)
     if err:
         return jsonify({"ok": False, "error": err}), 400
-    job_id = start_background_job(
-        "全員ドライラン",
-        lambda: run_all_scheduled(
-            force=True, dry_run=True, require_automation=False
-        ),
-    )
+    job_names = {
+        "all": "全員ドライラン",
+        "working": "出勤グループ・ドライラン",
+        "off": "お休みグループ・ドライラン",
+    }
+    job_name = job_names[group]
+    if _use_worker():
+        try:
+            from worker_client import worker_start_job
+
+            job_id = worker_start_job(job_name, dry_run=True, group=group)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    else:
+        if os.getenv("VERCEL"):
+            return jsonify({"ok": False, "error": _worker_required_error()}), 400
+        job_id = start_background_job(
+            job_name,
+            lambda jid, g=group: run_manual_batch(
+                group=g, dry_run=True, job_id=jid
+            ),
+            dry_run=True,
+            job_type="batch",
+            group=group,
+        )
     return jsonify(
         {
             "ok": True,
@@ -261,10 +351,72 @@ def api_run_dry_all():
 
 @app.get("/api/jobs/<job_id>")
 def api_job_status(job_id: str):
-    job = get_job(job_id)
+    if _use_worker():
+        try:
+            from worker_client import worker_get_job
+
+            job = worker_get_job(job_id)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    else:
+        job = get_job(job_id)
     if not job:
         return jsonify({"ok": False, "error": "ジョブが見つかりません"}), 404
     return jsonify({"ok": True, "job": job})
+
+
+@app.post("/api/jobs/<job_id>/pause")
+def api_job_pause(job_id: str):
+    if _use_worker():
+        try:
+            from worker_client import worker_pause_job
+
+            ok = worker_pause_job(job_id)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    else:
+        from job_runner import pause_job
+
+        ok = pause_job(job_id)
+    if not ok:
+        return jsonify({"ok": False, "error": "一時停止できません"}), 400
+    return jsonify({"ok": True, "paused": True})
+
+
+@app.post("/api/jobs/<job_id>/resume")
+def api_job_resume(job_id: str):
+    if _use_worker():
+        try:
+            from worker_client import worker_resume_job
+
+            ok = worker_resume_job(job_id)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    else:
+        from job_runner import resume_job
+
+        ok = resume_job(job_id)
+    if not ok:
+        return jsonify({"ok": False, "error": "再開できません"}), 400
+    return jsonify({"ok": True, "paused": False})
+
+
+@app.post("/api/jobs/<job_id>/cancel")
+def api_job_cancel(job_id: str):
+    if _use_worker():
+        try:
+            from worker_client import worker_cancel_job
+
+            ok = worker_cancel_job(job_id)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    else:
+        from job_runner import cancel_job
+
+        ok = cancel_job(job_id)
+    if not ok:
+        return jsonify({"ok": False, "error": "中止できません"}), 400
+    return jsonify({"ok": True, "cancelled": True})
 
 
 @app.post("/api/run-test/<account_id>")
@@ -275,7 +427,21 @@ def api_run_test(account_id: str):
         return jsonify({"ok": False, "error": "アカウントが見つかりません"}), 404
     if not settings.base_url:
         return jsonify({"ok": False, "error": "ログインURLを設定してください"}), 400
-    result = run_for_account(account, settings.base_url, dry_run=True, headed=False)
+    try:
+        if _use_worker():
+            from worker_client import worker_run_account
+
+            result = worker_run_account(
+                account_id, dry_run=True, respect_enabled=False
+            )
+        else:
+            if os.getenv("VERCEL"):
+                return jsonify({"ok": False, "error": _worker_required_error()}), 400
+            result = run_for_account(
+                account, settings.base_url, dry_run=True, headed=False
+            )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True, "result": result})
 
 
@@ -287,12 +453,77 @@ def api_run_account(account_id: str):
         return jsonify({"ok": False, "error": "アカウントが見つかりません"}), 404
     if not settings.base_url:
         return jsonify({"ok": False, "error": "ログインURLを設定してください"}), 400
-    result = run_with_busy_guard(
-        lambda: run_for_account(
-            account, settings.base_url, respect_enabled=False
-        )
+    job_name = f"「{account.name}」を送信"
+    try:
+        if _use_worker():
+            from worker_client import worker_start_account_job
+
+            job_id = worker_start_account_job(
+                account_id, dry_run=False, respect_enabled=False
+            )
+        else:
+            if os.getenv("VERCEL"):
+                return jsonify({"ok": False, "error": _worker_required_error()}), 400
+            job_id = start_background_job(
+                job_name,
+                lambda jid, aid=account_id: run_single_account(
+                    aid, dry_run=False, respect_enabled=False, job_id=jid
+                ),
+                dry_run=False,
+                job_type="single",
+                account_name=account.name,
+            )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify(
+        {
+            "ok": True,
+            "job_id": job_id,
+            "job_type": "single",
+            "account_name": account.name,
+            "message": "送信を開始しました。",
+        }
     )
-    return jsonify({"ok": True, "result": result})
+
+
+@app.post("/api/attendance/reset")
+def api_attendance_reset():
+    settings = reset_working_today()
+    working, off = partition_enabled_by_attendance()
+    return jsonify(
+        {
+            "ok": True,
+            "attendance_date": settings.attendance_date,
+            "working_today_ids": list(settings.working_today_ids),
+            "working_today": [a.to_public() for a in working],
+            "off_today": [a.to_public() for a in off],
+            "attendance_label": attendance_today_label(),
+        }
+    )
+
+
+@app.post("/api/attendance/<account_id>")
+def api_attendance(account_id: str):
+    data = request.json or {}
+    if "working" not in data:
+        return jsonify({"ok": False, "error": "working を指定してください"}), 400
+    try:
+        settings = set_account_working_today(account_id, bool(data["working"]))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    working, off = partition_enabled_by_attendance()
+    return jsonify(
+        {
+            "ok": True,
+            "account_id": account_id,
+            "working": bool(data["working"]),
+            "attendance_date": settings.attendance_date,
+            "working_today_ids": list(settings.working_today_ids),
+            "working_today": [a.to_public() for a in working],
+            "off_today": [a.to_public() for a in off],
+            "attendance_label": attendance_today_label(),
+        }
+    )
 
 
 @app.post("/api/accounts/<account_id>/enabled")
@@ -337,7 +568,7 @@ def api_client_heartbeat():
         return jsonify({"ok": False, "error": "tab_id required"}), 400
     client_busy = bool(payload.get("busy"))
     _touch_client_tab(tab_id)
-    busy = is_system_busy() or client_busy
+    busy = _combined_system_busy() or client_busy
     return jsonify({"ok": True, "active_count": _prune_client_tabs(grace=busy), "busy": busy})
 
 
@@ -351,22 +582,30 @@ def api_client_heartbeat_leave():
     ).strip()
     if tab_id:
         _remove_client_tab(tab_id)
-    busy = is_system_busy()
+    busy = _combined_system_busy()
     return jsonify({"ok": True, "active_count": _prune_client_tabs(grace=busy)})
 
 
 @app.get("/api/client-heartbeat/status")
 def api_client_heartbeat_status():
-    busy = is_system_busy()
+    from job_runner import get_active_job_summary
+
+    busy = _combined_system_busy()
     count = _prune_client_tabs(grace=busy)
-    return jsonify(
-        {
-            "ok": True,
-            "active_count": count,
-            "auto_exit": _auto_exit_enabled(),
-            "busy": busy,
-        }
-    )
+    active_job = get_active_job_summary()
+    payload: dict = {
+        "ok": True,
+        "active_count": count,
+        "auto_exit": _auto_exit_enabled(),
+        "busy": busy,
+        "running": busy,
+        "completed": not busy,
+    }
+    if active_job:
+        payload["job_type"] = active_job.get("job_type")
+        payload["group"] = active_job.get("group")
+        payload["active_job"] = active_job
+    return jsonify(payload)
 
 
 def _build_data_payload() -> dict:
@@ -375,6 +614,7 @@ def _build_data_payload() -> dict:
 
     s = load_settings()
     accounts = [a.to_public() for a in load_accounts()]
+    working, off = partition_enabled_by_attendance()
     info = platform_schedule_status(s)
     last_run = s.last_run if isinstance(s.last_run, dict) else None
     return {
@@ -390,6 +630,11 @@ def _build_data_payload() -> dict:
         "mac_schedule": info,
         "server_time": datetime.now(JST).strftime("%H:%M"),
         "last_run": last_run,
+        "attendance_date": s.attendance_date,
+        "attendance_label": attendance_today_label(),
+        "working_today_ids": list(load_working_today_ids()),
+        "working_today": [a.to_public() for a in working],
+        "off_today": [a.to_public() for a in off],
         "storage_mode": storage_mode(),
         "storage_warning": storage_warning(),
         "storage_debug": storage_debug(),

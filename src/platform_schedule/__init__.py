@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from typing import Any
 
 from store import Settings, load_settings, save_settings
 
-from .common import build_weekly_triggers, has_enabled_slots, iter_upcoming_wake_times
+from .common import build_weekly_triggers, iter_upcoming_wake_times
 
 __all__ = [
     "sync_platform_schedule",

@@ -27,7 +27,7 @@
     if (modal && !modal.hidden) return true;
 
     const runStatus = document.getElementById("run-status");
-    if (runStatus && !runStatus.hidden) return true;
+    if (runStatus && runStatus.classList.contains("running")) return true;
 
     const form = document.getElementById("form-account-save");
     if (form) {
@@ -69,12 +69,19 @@
     }
   }
 
-  function buildAccountCardHtml(a) {
+  function buildAccountCardHtml(a, workingIds) {
     const compact = document.body.dataset.accountListCompact === "1";
     const enabled = !!a.enabled;
     const toggleClass = enabled ? "btn-toggle-auto" : "btn-toggle-auto btn-toggle-auto-off";
     const toggleLabel = enabled ? "自動送信対象外にする" : "自動送信対象にする";
     const metaExtra = enabled ? "" : " · 自動送信対象外";
+    const checked = workingIds && workingIds.has(a.id);
+    const attendanceCheck = compact
+      ? `<label class="attendance-check" title="本日出勤（優先送信）">
+          <input type="checkbox" class="attendance-checkbox" data-id="${escapeHtml(a.id)}"${checked ? " checked" : ""}>
+          <span class="attendance-check-label">出勤</span>
+        </label>`
+      : "";
     const editBtn = compact
       ? ""
       : `<button type="button" class="btn-secondary btn-edit"
@@ -87,22 +94,47 @@
       : `<button type="button" class="btn-danger btn-delete-account"
               data-id="${escapeHtml(a.id)}"
               data-name="${escapeHtml(a.name)}">削除</button>`;
-    return `
-      <li class="account-card" data-account-id="${escapeHtml(a.id)}" data-account-name="${escapeHtml(a.name)}">
-        <div class="account-card-main">
-          <strong class="account-name">${escapeHtml(a.name)}</strong>
-          <span class="hint account-meta">${escapeHtml(a.login_id)}${metaExtra}</span>
-          <div class="actions-inline actions-main">
-            ${editBtn}
-            <button type="button" class="btn-primary btn-run"
+    const runBtn = compact
+      ? ""
+      : `<button type="button" class="btn-primary btn-run"
               data-id="${escapeHtml(a.id)}"
-              data-name="${escapeHtml(a.name)}">今すぐ送信</button>
-            <button type="button" class="${toggleClass}"
+              data-name="${escapeHtml(a.name)}">今すぐ送信</button>`;
+    const toggleBtn = compact
+      ? ""
+      : `<button type="button" class="${toggleClass}"
               data-id="${escapeHtml(a.id)}"
               data-name="${escapeHtml(a.name)}"
-              data-enabled="${enabled ? "true" : "false"}">${toggleLabel}</button>
+              data-login="${escapeHtml(a.login_id)}"
+              data-enabled="${enabled ? "true" : "false"}">${toggleLabel}</button>`;
+    const actionsBlock = compact
+      ? ""
+      : `<div class="actions-inline actions-main actions-main--detail">
+            ${editBtn}
+            ${runBtn}
+            ${toggleBtn}
             ${deleteBtn}
-          </div>
+          </div>`;
+    const bodyWrapOpen = compact ? `<div class="account-card-body">` : "";
+    const bodyWrapClose = compact ? `</div>` : "";
+    const metaLine = compact
+      ? enabled
+        ? ""
+        : `<span class="hint account-meta account-meta--status">自動送信対象外</span>`
+      : "";
+    const infoBlock = compact
+      ? `<strong class="account-name">${escapeHtml(a.name)}</strong>${metaLine}`
+      : `<div class="account-card-info">
+          <strong class="account-name">${escapeHtml(a.name)}</strong>
+          <span class="hint account-meta">${escapeHtml(a.login_id)}${metaExtra}</span>
+        </div>`;
+    return `
+      <li class="account-card${compact ? " account-card--register" : " account-card--detail"}" data-account-id="${escapeHtml(a.id)}" data-account-name="${escapeHtml(a.name)}">
+        <div class="account-card-main${compact ? " account-card-main--register" : " account-card-main--detail"}">
+          ${attendanceCheck}
+          ${bodyWrapOpen}
+          ${infoBlock}
+          ${actionsBlock}
+          ${bodyWrapClose}
         </div>
       </li>`;
   }
@@ -144,7 +176,9 @@
       return;
     }
     if (empty) empty.hidden = true;
-    list.innerHTML = accounts.map(buildAccountCardHtml).join("");
+    const workingIds = new Set(data.working_today_ids || []);
+    list.innerHTML = accounts.map((a) => buildAccountCardHtml(a, workingIds)).join("");
+    window.MiteneAttendance?.applyAttendanceLists(data);
     if (window.accountSearchActive && typeof window.applyAccountNameFilter === "function") {
       window.applyAccountNameFilter();
     } else if (typeof window.showAllAccountCards === "function") {
@@ -160,8 +194,8 @@
     if (page === "index") applyIndexPage(data);
   }
 
-  async function pullData() {
-    if (syncing || shouldSkipSync()) return;
+  async function pullData(force) {
+    if (!force && (syncing || shouldSkipSync())) return;
     syncing = true;
     try {
       const res = await fetch("/api/data", { cache: "no-store" });
@@ -170,6 +204,7 @@
       applyPage(data);
       lastSyncAt = Date.now();
       setSyncIndicator(data.server_time || "");
+      return data;
     } catch (_) {
       /* 次回再試行 */
     } finally {
@@ -177,7 +212,13 @@
     }
   }
 
-  window.MiteneSync = { pull: pullData, refresh: pullData, pause };
+  window.MiteneSync = {
+    pull: () => pullData(false),
+    refresh: () => pullData(false),
+    pullForce: () => pullData(true),
+    applyData: applyPage,
+    pause,
+  };
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;

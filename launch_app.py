@@ -194,6 +194,7 @@ def wait_until_browser_tabs_closed(
             if had_client and active_count == 0 and not waiting_for_work:
                 waiting_for_work = True
                 print("\n送信中のため、完了までサーバーを動かします…")
+                print("（画面が暗くなっても送信は続きます。PCのスリープ設定も「なし」推奨）")
             time.sleep(1.5)
             continue
 

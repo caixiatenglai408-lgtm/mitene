@@ -9,8 +9,8 @@ mitene:
   max_send_per_run: 0
   must_use_full_budget: false  # 送れる分だけ送る（サイト拒否時に0件で止めない）
   max_scroll_rounds: 30
-  member_cooldown_days: 10  # 同一会員への再送間隔（候補不足時は無視）
-  max_no_history_sends_per_day: 6  # 履歴なし会員への1日上限（候補不足時は無視）
+  member_cooldown_days: 0  # 0=制限なし（同一会員への再送間隔）
+  max_no_history_sends_per_day: 0  # 0=制限なし（履歴なし会員への1日上限）
   # 送信順（gid=女の子ID。新規=kitene_question「ミテネ履歴」に「送信済」なし）
   priority_steps:
     # ① マイガール（新規会員を最優先）
@@ -31,28 +31,38 @@ mitene:
       member_filter: sendable
       list_path: /J10ComeonVisitorList.php
     # ⑤ マイガール（送信日が古い順・同日はランダム）
-    # ※①〜④で新規が1人もいない場合は⑤をスキップし、
-    #   全タブ合算→送信日古い順のフォールバックへ
     - tab: マイガール
       member_filter: sent_oldest_first
       list_path: /J10ComeonMyGirlList.php
+    # ⑥ キープ（送信日が古い順・同日はランダム）
+    - tab: キープ
+      member_filter: sent_oldest_first
+      list_path: /J10ComeonKeepList.php
+    # ⑦ マッチ率（送信日が古い順・同日はランダム）
+    - tab: マッチ率
+      member_filter: sent_oldest_first
+      list_path: /J10ComeonAiMatchingList.php
   confirm_buttons:
     - "ミテネを送る"
     - "送る"
     - "OK"
   skip_special_banners: true
+  # 会員抽出デバッグ（各タブの漏斗ログ・除外理由・送信対象一覧）
+  member_extraction_debug: false
+  # （非推奨・未使用）旧調査用フラグ。一覧取得は常にスクロール走査マージを使用
+  member_scroll_merge_parse: false
 
 # 待機時間（ミテネを押す間隔だけ手動風・それ以外は短めでOK）
 human:
   enabled: true
   fast_send: true   # クリック処理のみ短縮（会員間の待ちは between_members_ms）
   typing_delay_ms: [40, 120]
-  action_delay_ms: [150, 350]
-  between_members_ms: [800, 1200]   # ミテネを送る間隔（0.8〜1.2秒）
-  between_accounts_ms: [60000, 120000]
+  action_delay_ms: [80, 150]
+  between_members_ms: [300, 500]   # ミテネを送る間隔（0.3〜0.5秒）
+  between_accounts_ms: [3000, 5000]  # 次の女の子まで（3〜5秒）
   tab_switch_delay_ms: [400, 800]
-  after_login_delay_ms: [800, 1500]
-  after_send_delay_ms: [80, 200]
+  after_login_delay_ms: [0, 0]
+  after_send_delay_ms: [40, 80]
   scroll_probability: 0
   idle_pause_probability: 0
   idle_pause_ms: [300, 600]

@@ -1,0 +1,119 @@
+姫デコ ミテネ自動送信 — Windows での使い方
+==========================================
+
+■ 文字化けして開けないとき
+
+Mac のフォルダをそのまま USB コピーすると、日本語ファイル名が
+文字化けすることがあります（例: 起動.bat → 譌･蜍・bat）。
+
+【おすすめ】次のどちらかで入れ直してください。
+
+  方法1: GitHub から取得（いちばん確実）
+    1. Windows に Git を入れる（または GitHub Desktop）
+    2. コマンドプロンプトで:
+       git clone https://github.com/caixiatenglai408-lgtm/mitene.git MiteneAutoSend
+    3. MiteneAutoSend フォルダを開く
+
+  方法2: ZIP で渡す（Mac 側で準備）
+    1. Mac でフォルダ名を英語に変える: MiteneAutoSend
+    2. .venv フォルダは削除してから ZIP（Windows で作り直す）
+    3. Windows で ZIP を展開
+
+■ USB で渡す場合（手順まとめ）
+
+【A. Mac での準備】
+
+  1. フォルダをコピー用に用意
+     例: デスクトップの「自動送信機能」を複製 → 名前を MiteneAutoSend に変更
+
+  2. 次を削除（USB に入れない）
+     × .venv
+     × logs（あれば）
+     × playwright-browsers（あれば）
+     × .git（なくても可・あっても動く）
+
+  3. USB メモリに MiteneAutoSend フォルダごとコピー
+
+  ※ または Mac のターミナルで ZIP を作る（おすすめ）:
+     cd "/Users/あなた/Desktop/自動送信機能"
+     ./scripts/pack_for_windows.sh
+     → dist/MiteneAutoSend-windows.zip を USB に入れる
+
+【B. Windows での作業】
+
+  1. USB から PC にコピー
+     置き場所: C:\MiteneAutoSend
+     （デスクトップの日本語フォルダ名は避ける）
+
+  2. ZIP の場合は右クリック →「すべて展開」
+
+  3. Python 3 をインストール（初回のみ）
+     https://www.python.org/downloads/
+     ・「Download Python 3.x」をクリック
+     ・インストール画面で必ず
+       「Add python.exe to PATH」にチェック
+     ・「Install Now」
+
+  4. MiteneAutoSend フォルダを開く
+
+  5. 初回のみ: install-browser.bat をダブルクリック
+     （数分かかる。Chromium をダウンロード）
+
+  6. open-browser.bat をダブルクリック
+     → ブラウザで管理画面が開く（http://127.0.0.1:5050）
+
+  7. 次回以降は open-browser.bat だけで OK
+
+  ※ 日本語の .bat が文字化けしているときは
+     必ず install-browser.bat / open-browser.bat（英語名）を使う
+
+【C. 女の子ログイン・送信】
+
+  1. 管理画面 →「女の子ログイン」で URL・ID・PW を登録
+  2.「設定」でスケジュールなどを設定
+  3.「今すぐ送信」で動作確認
+
+  ※ Mac で登録した data は USB に含めれば引き継げます
+    （data\accounts.json と data\settings.json がある場合）
+
+■ コピーしてはいけないもの
+
+  × .venv  … Mac 用。Windows では使えません（起動時に自動作成）
+  × .command … Mac 専用。Windows では動きません
+  × logo.app / ブラウザで開く.app … Mac 専用
+
+■ Windows での起動（初回）
+
+  1. Python 3 をインストール（https://www.python.org/downloads/）
+     「Add python.exe to PATH」にチェック
+  2. 次のどちらかをダブルクリック:
+       install-browser.bat  （初回のみ・Chromium 取得）
+       または ブラウザをインストール.bat
+  3. 起動:
+       open-browser.bat  （ブラウザで管理画面）
+       または start.bat  （専用ウィンドウ）
+  ※ 日本語名が読める場合は ブラウザで開く.bat / 起動.bat でも同じです
+
+  管理画面: http://127.0.0.1:5050
+
+■ うまくいかないとき
+
+  - フォルダパスに日本語が多いと失敗することがあります
+    → C:\MiteneAutoSend のように英語パスに置く
+  - ウイルス対策ソフトがブロックしたら「許可」
+
+■ 送信中に画面が暗くなる・止まるとき（Windows）
+
+  送信中は自動でスリープ抑止しますが、OS 設定も確認してください。
+
+  1. 設定 → システム → 電源とバッテリー（または 電源とスリープ）
+  2. 電源接続時:
+     ・画面: お好みで OK（暗くても送信は続くようになっています）
+     ・スリープ: 「なし」にするとより確実
+  3. ノート PC は電源アダプタ接続を推奨
+
+  ※ 最新版の open-browser.bat / start.bat を使ってください
+    （git pull または USB で入れ直し）
+
+  ※ 送信中に画面が暗くなっても、管理画面は「通信復帰待ち」と表示し
+    続きます。エラー表示は実際に失敗したときだけです。

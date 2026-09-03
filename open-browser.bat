@@ -6,14 +6,14 @@ set PYTHON=%~dp0.venv\Scripts\python.exe
 set PIP=%~dp0.venv\Scripts\pip.exe
 
 if not exist "%PYTHON%" (
-  echo 初回セットアップ中...
+  echo First-time setup...
   python -m venv .venv
   "%PIP%" install -r requirements.txt
   "%PYTHON%" -m playwright install chromium
 )
 
 if not exist "%PYTHON%" (
-  echo Python が見つかりません。https://www.python.org/downloads/ からインストールしてください。
+  echo Python not found. Install from https://www.python.org/downloads/
   pause
   exit /b 1
 )
@@ -21,8 +21,7 @@ if not exist "%PYTHON%" (
 "%PYTHON%" scripts\ensure_playwright_browsers.py
 if errorlevel 1 (
   echo.
-  echo ブラウザのダウンロードに失敗しました。
-  echo 「ブラウザをインストール.bat」を実行してから再度お試しください。
+  echo Browser install failed. Run install-browser.bat first.
   pause
   exit /b 1
 )
@@ -31,9 +30,8 @@ if not exist logs mkdir logs
 
 echo.
 echo ==========================================
-echo   ブラウザで管理画面を開きます
+echo   Opening dashboard in browser
 echo   URL: http://127.0.0.1:5050
-echo   終了: ブラウザのタブを閉じる
 echo ==========================================
 echo.
 

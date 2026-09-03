@@ -44,6 +44,20 @@ BUNDLE_ROOT = bundle_root()
 DATA_ROOT = data_root()
 
 
+def logs_root() -> Path:
+    """送信ログの保存先（Vercel は /tmp 配下）."""
+    root = DATA_ROOT / "logs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def auth_root() -> Path:
+    """Playwright セッション保存先（Vercel は /tmp 配下）."""
+    root = DATA_ROOT / "playwright" / ".auth"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def playwright_browsers_dir() -> Path:
     return APP_ROOT / "playwright-browsers"
 

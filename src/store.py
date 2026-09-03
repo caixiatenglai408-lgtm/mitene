@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app_paths import APP_ROOT, DATA_ROOT
+from app_paths import APP_ROOT, DATA_ROOT, auth_root
 from crypto_util import decrypt_secret, encrypt_secret
 from data_store import read_accounts as _read_accounts_payload
 from data_store import read_settings as _read_settings_payload
@@ -89,6 +87,9 @@ class Settings:
     sleep_schedule_enabled: bool = True
     # 直近の送信結果（手動・自動共通の表示用）
     last_run: dict[str, Any] | None = None
+    # 本日出勤（チェックした女の子を優先送信）— attendance_date とセットで保存
+    attendance_date: str = ""
+    working_today_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -97,6 +98,8 @@ class Settings:
             "schedule": self.schedule,
             "last_run_slot": self.last_run_slot,
             "sleep_schedule_enabled": self.sleep_schedule_enabled,
+            "attendance_date": self.attendance_date,
+            "working_today_ids": list(self.working_today_ids),
         }
         if self.last_run:
             d["last_run"] = self.last_run
@@ -145,6 +148,10 @@ def load_settings() -> Settings:
         last_run_slot=str(raw.get("last_run_slot", "")),
         sleep_schedule_enabled=bool(raw.get("sleep_schedule_enabled", True)),
         last_run=last_run if isinstance(last_run, dict) else None,
+        attendance_date=str(raw.get("attendance_date", "")),
+        working_today_ids=[
+            str(i) for i in (raw.get("working_today_ids") or []) if str(i)
+        ],
     )
     # 時間枠の追加・削除・移行時は settings.json を更新
     merged_raw = raw.get("schedule") or {}
@@ -165,11 +172,6 @@ def load_settings() -> Settings:
     if needs_save:
         save_settings(settings)
     return settings
-
-
-def slots_for_template() -> list[tuple[str, str]]:
-    """テンプレート用（表示順固定）."""
-    return [(key, SLOTS[key]) for key in SLOT_KEYS]
 
 
 def save_last_run_report(
@@ -332,7 +334,7 @@ def delete_account(account_id: str) -> bool:
     if len(new_list) == len(accounts):
         return False
     save_accounts(new_list)
-    auth_file = ROOT / "playwright" / ".auth" / f"{account_id}.json"
+    auth_file = auth_root() / f"{account_id}.json"
     if auth_file.exists():
         auth_file.unlink()
     return True
@@ -358,6 +360,97 @@ def set_automation(enabled: bool) -> Settings:
     settings.automation_enabled = enabled
     save_settings(settings)
     return settings
+
+
+def attendance_today_key(now: datetime | None = None) -> str:
+    now = now or datetime.now(JST)
+    return now.strftime("%Y-%m-%d")
+
+
+def attendance_today_label(now: datetime | None = None) -> str:
+    now = now or datetime.now(JST)
+    wd = WEEKDAY_LABELS[WEEKDAYS[now.weekday()]]
+    return f"{now.month}月{now.day}日（{wd}）"
+
+
+def _sync_attendance_date(settings: Settings) -> bool:
+    """日付が変わっていたら出勤チェックをリセット。変更があれば True."""
+    today = attendance_today_key()
+    if settings.attendance_date == today:
+        return False
+    settings.attendance_date = today
+    settings.working_today_ids = []
+    return True
+
+
+def _prune_working_today_ids(settings: Settings) -> bool:
+    valid = {a.id for a in load_accounts()}
+    pruned = [i for i in settings.working_today_ids if i in valid]
+    if pruned == settings.working_today_ids:
+        return False
+    settings.working_today_ids = pruned
+    return True
+
+
+def load_working_today_ids() -> set[str]:
+    settings = load_settings()
+    changed = _sync_attendance_date(settings)
+    changed = _prune_working_today_ids(settings) or changed
+    if changed:
+        save_settings(settings)
+    return set(settings.working_today_ids)
+
+
+def set_account_working_today(account_id: str, working: bool) -> Settings:
+    if get_account(account_id) is None:
+        raise ValueError("アカウントが見つかりません")
+    settings = load_settings()
+    _sync_attendance_date(settings)
+    ids = list(settings.working_today_ids)
+    if working:
+        if account_id not in ids:
+            ids.append(account_id)
+    else:
+        ids = [i for i in ids if i != account_id]
+    settings.working_today_ids = ids
+    save_settings(settings)
+    return settings
+
+
+def reset_working_today() -> Settings:
+    """登録一覧の出勤チェックをすべて外す."""
+    settings = load_settings()
+    settings.attendance_date = attendance_today_key()
+    settings.working_today_ids = []
+    save_settings(settings)
+    return settings
+
+
+def order_accounts_by_attendance(accounts: list[Account]) -> list[Account]:
+    working_ids = load_working_today_ids()
+    working = [a for a in accounts if a.id in working_ids]
+    off = [a for a in accounts if a.id not in working_ids]
+    return working + off
+
+
+
+
+def partition_enabled_by_attendance() -> tuple[list[Account], list[Account]]:
+    enabled = [a for a in load_accounts() if a.enabled]
+    working_ids = load_working_today_ids()
+    working = [a for a in enabled if a.id in working_ids]
+    off = [a for a in enabled if a.id not in working_ids]
+    return working, off
+
+
+def accounts_for_manual_group(group: str) -> list[Account]:
+    """手動送信の順序（本日出勤一覧→お休み一覧の表示順）."""
+    working, off = partition_enabled_by_attendance()
+    if group == "working":
+        return list(working)
+    if group == "off":
+        return list(off)
+    return list(working) + list(off)
 
 
 def current_slot_key(now: datetime | None = None) -> str | None:

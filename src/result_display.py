@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
-_NO_REMAINING_RE = re.compile(r"ミテネ残り回数.*0|残り回数.*0\s*です")
+
+def is_budget_read_failed_result(r: dict[str, Any]) -> bool:
+    return r.get("status") == "budget_read_failed"
 
 
 def is_no_remaining_result(r: dict[str, Any]) -> bool:
-    if r.get("status") == "no_remaining":
-        return True
-    text = " ".join(
-        str(r.get(k) or "")
-        for k in ("message", "error")
-    )
-    return bool(_NO_REMAINING_RE.search(text))
+    return r.get("status") == "no_remaining"
 
 
 def classify_result(r: dict[str, Any]) -> str:
@@ -23,27 +18,31 @@ def classify_result(r: dict[str, Any]) -> str:
         return "skipped"
     if r.get("status") == "zero_send":
         return "error"
+    if r.get("dry_run"):
+        return "dry_run"
+    if (r.get("sent") or 0) > 0:
+        return "success"
+    if is_budget_read_failed_result(r):
+        return "budget_read_failed"
     if is_no_remaining_result(r):
         return "no_remaining"
     if r.get("error") and not r.get("name"):
         return "error"
     if r.get("ok") is False or r.get("error"):
         return "error"
-    if r.get("dry_run"):
-        return "dry_run"
-    if (r.get("sent") or 0) > 0:
-        return "success"
     if r.get("ok"):
         return "error"
     return "error"
 
 
 def _detail_for_completed(r: dict[str, Any], kind: str, *, dry_run: bool) -> str:
-    if kind == "no_remaining":
-        return "ミテネ残り回数なし"
     if kind == "dry_run" or dry_run:
         return "ドライラン（送信なし）"
-    sent = r.get("sent") or 0
+    sent = int(r.get("sent") or 0)
+    if sent > 0:
+        return f"{sent} 件送信"
+    if kind == "no_remaining":
+        return "ミテネ残り回数なし"
     return f"{sent} 件送信"
 
 
@@ -52,6 +51,19 @@ def _detail_for_error(r: dict[str, Any]) -> str:
         str(r.get("error") or r.get("message") or "送信できませんでした")
         .strip()
     )
+
+
+def build_partial_errors_display(
+    results: list[dict[str, Any]] | None, *, dry_run: bool = False
+) -> dict[str, Any]:
+    """送信中に完了・エラーを随時表示する用."""
+    full = build_run_display(results, dry_run=dry_run)
+    return {
+        "summary": full["summary"],
+        "completed": list(full.get("completed") or []),
+        "errors": list(full.get("errors") or []),
+        "has_issues": bool(full.get("errors")),
+    }
 
 
 def build_run_display(

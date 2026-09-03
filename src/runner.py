@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+import os
 from typing import Any
 
 import yaml
@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from human_behavior import HumanBehavior
 from mitene_sender import (
+    BUDGET_READ_FAILED_PREFIX,
     DEFAULT_PRIORITY_STEPS,
     BrowserConfig,
     DailyLimitReached,
@@ -20,9 +21,24 @@ from mitene_sender import (
     MiteneStandardConfig,
     PriorityStep,
 )
+from app_paths import auth_root, logs_root
 from store import Account, ROOT
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_sent_this_run(sender: MiteneSender | None) -> int:
+    """今回実行で実際に送った件数（MiteneSender インスタンス内のみ参照）."""
+    if sender is None:
+        return 0
+    report = getattr(sender, "_last_run_report", None) or {}
+    from_report = int(report.get("sent") or 0)
+    if from_report > 0:
+        return from_report
+    sent_keys = getattr(sender, "_sent_member_keys", None)
+    if sent_keys:
+        return len(sent_keys)
+    return 0
 
 
 def load_app_config() -> dict:
@@ -41,6 +57,13 @@ def _as_config_dict(value: Any, name: str) -> dict[str, Any]:
 
 
 def _parse_priority_steps(standard_raw: dict[str, Any]) -> list[PriorityStep]:
+    # NOTE (baseline 2026-07-12 / Phase 1):
+    # 戻り値の PriorityStep 列は MiteneStandardConfig.priority_steps に入るが、
+    # 現行の送信経路 _execute_phased_send_pipeline は 7 フェーズの順序・条件を
+    # ハードコードしており、ここでの解析結果は「priority_steps が非空か（=
+    # _send_mitene_standard の `if steps:` を真にするか）」の判定にしか使われない。
+    # config.yaml はステップ内容の完全な制御元ではない。詳細は docs/current_baseline.md。
+    # （config とパイプラインの統合は将来 Phase の課題。Phase 1 では変更しない）
     steps_raw = standard_raw.get("priority_steps") or []
     if isinstance(steps_raw, dict):
         if steps_raw.get("tab"):
@@ -82,6 +105,7 @@ def build_sender(
     account_id: str,
     dry_run: bool = False,
     headed: bool = False,
+    progress_callback: Any = None,
 ) -> MiteneSender:
     load_dotenv(ROOT / ".env")
     cfg = load_app_config()
@@ -95,8 +119,8 @@ def build_sender(
     human_raw = _as_config_dict(cfg.get("human"), "human")
     logging_raw = _as_config_dict(cfg.get("logging"), "logging")
 
-    log_dir = ROOT / "logs" / account_id
-    auth_path = ROOT / "playwright" / ".auth" / f"{account_id}.json"
+    log_dir = logs_root() / account_id
+    auth_path = auth_root() / f"{account_id}.json"
 
     return MiteneSender(
         base_url=base_url,
@@ -126,6 +150,20 @@ def build_sender(
                 )
             ),
             skip_special_banners=bool(standard_raw.get("skip_special_banners", True)),
+            member_extraction_debug=bool(
+                standard_raw.get("member_extraction_debug", False)
+            )
+            or os.environ.get("MITENE_MEMBER_EXTRACTION_DEBUG", "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on"),
+            member_scroll_merge_parse=bool(
+                standard_raw.get("member_scroll_merge_parse", False)
+            )
+            or os.environ.get("MITENE_SCROLL_MERGE_PARSE", "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on"),
         ),
         gift=MiteneGiftConfig(
             menu_button_text=gift_raw.get("menu_button_text", "ミテネギフトを送る"),
@@ -147,7 +185,41 @@ def build_sender(
         screenshot_on_error=bool(logging_raw.get("screenshot_on_error", True)),
         dry_run=dry_run,
         human=HumanBehavior(human_raw),
+        progress_callback=progress_callback,
     )
+
+
+def _account_error_result(
+    account: Account,
+    sender: MiteneSender | None,
+    error: BaseException,
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """送信失敗時の結果（部分送信があれば件数を残す）."""
+    result: dict = {
+        "account_id": account.id,
+        "name": account.name,
+        "ok": False,
+        "status": "error",
+        "error": str(error),
+        "dry_run": dry_run,
+    }
+    if sender is None:
+        return result
+    try:
+        sent = resolve_sent_this_run(sender)
+        if sent > 0:
+            result["sent"] = sent
+            report = getattr(sender, "_last_run_report", None) or {}
+            if report:
+                result["report"] = report
+            result["ok"] = True
+            result["status"] = "success"
+            result["message"] = str(error)
+    except Exception:
+        pass
+    return result
 
 
 def run_for_account(
@@ -175,18 +247,23 @@ def run_for_account(
             "ok": False,
         }
 
-    sender = build_sender(
-        base_url=base_url,
-        login_id=account.login_id,
-        password=account.password,
-        account_id=account.id,
-        dry_run=dry_run,
-        headed=headed,
-    )
+    from job_runner import JobCancelled, get_send_progress_callback
+
+    sender: MiteneSender | None = None
+    result: dict | None = None
     try:
+        sender = build_sender(
+            base_url=base_url,
+            login_id=account.login_id,
+            password=account.password,
+            account_id=account.id,
+            dry_run=dry_run,
+            headed=headed,
+            progress_callback=get_send_progress_callback(),
+        )
         sent = sender.run()
         status = "dry_run" if dry_run else ("success" if sent > 0 else "zero_send")
-        result: dict = {
+        result = {
             "account_id": account.id,
             "name": account.name,
             "ok": True,
@@ -198,22 +275,47 @@ def run_for_account(
             result["message"] = sender.zero_send_message()
             if sender._last_run_report:
                 result["report"] = sender._last_run_report
-        return result
     except DailyLimitReached as e:
-        return {
+        sent = resolve_sent_this_run(sender)
+        result = {
             "account_id": account.id,
             "name": account.name,
             "ok": True,
-            "sent": 0,
+            "sent": sent,
             "status": "no_remaining",
             "message": str(e),
+            "dry_run": dry_run,
         }
+        if sender is not None and sender._last_run_report:
+            result["report"] = sender._last_run_report
+    except RuntimeError as e:
+        msg = str(e)
+        if BUDGET_READ_FAILED_PREFIX in msg:
+            result = {
+                "account_id": account.id,
+                "name": account.name,
+                "ok": False,
+                "sent": 0,
+                "status": "budget_read_failed",
+                "error": msg,
+                "message": msg,
+                "dry_run": dry_run,
+            }
+        else:
+            logger.exception("%s: 送信失敗", account.name)
+            result = _account_error_result(account, sender, e, dry_run=dry_run)
+    except JobCancelled:
+        raise
     except Exception as e:
         logger.exception("%s: 送信失敗", account.name)
-        return {
+        result = _account_error_result(account, sender, e, dry_run=dry_run)
+    if result is None:
+        result = {
             "account_id": account.id,
             "name": account.name,
             "ok": False,
             "status": "error",
-            "error": str(e),
+            "error": "送信結果を取得できませんでした",
+            "dry_run": dry_run,
         }
+    return result

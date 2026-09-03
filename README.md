@@ -184,16 +184,24 @@ Chrome / Edge で `http://127.0.0.1:5050` を開き、メニューから **「�
 
 ## 送信ロジック
 
-1. ホームの「ミテネできる会員を探す」直下の **残り回数** を取得
-2. 次の順で自動操作  
-   - **①** ログイン（女の子ログインに登録したID・PW）  
-   - **②** ホームでミテネ残り回数を取得  
-   - **③** 「ミテネできる会員を探す」→ 会員一覧（`J10ComeonVisitorList.php`）で「ミテネを送る」を残り回数ぶん  
-   - （任意）`config.yaml` の `priority_steps` にタブを書くと、マイガール→キープ→マッチ率の順にもできる
-3. **1会員ずつ** 送信（連打しない）
-4. **送信間隔** … ミテネを押す間隔は約1〜2秒（`human.between_members_ms`）
+> **正確な現行仕様は [`docs/current_baseline.md`](docs/current_baseline.md) を参照。以下は概要で、食い違う場合は実行コードと `docs/current_baseline.md` が正。**
 
-遅くしたい・規制が心配な場合は `between_members_ms` を `[9000, 32000]` などに長めにしてください。
+1. **①** ログイン（女の子ログインに登録したID・PW / `J1Login.php`）
+2. **②** ホームで **ミテネ残り回数** を取得 → その回数を「送信予算（budget）」として固定
+3. **③** `config.yaml` の `flow: standard` / `priority_steps`（7件）で、`_execute_phased_send_pipeline` が次の順に会員一覧を巡回して「ミテネを送る」を予算ぶん送信:
+   1. マイガール（新規のみ）
+   2. キープ（新規のみ）
+   3. マッチ率（新規のみ）
+   4. マイガール（送信日が古い順）
+   5. みたよ（③マッチ率で新規0件のときだけ）
+   6. キープ（送信日が古い順）
+   7. マッチ率（送信日が古い順）
+4. **1会員ずつ** 送信（連打しない）。同一実行内で同じ会員への再送・失敗リトライはしない。
+5. **送信間隔** … `config.yaml` の `human.between_members_ms`（現在 `[300, 500]` = 0.3〜0.5秒）。女の子どうしの間隔は `between_accounts_ms`（現在 `[3000, 5000]` = 3〜5秒）。
+
+規制が心配なときは `config.yaml` の `human.between_members_ms` / `between_accounts_ms` を長めにしてください（例: `[9000, 32000]`）。
+
+> `config.yaml` の `priority_steps` は現状「7フェーズ経路を有効化するスイッチ」としてのみ働き、巡回順そのものは `_execute_phased_send_pipeline` 側のハードコードが優先します（詳細は `docs/current_baseline.md`）。
 
 ## CLI（1人だけ試す場合）
 
@@ -232,6 +240,45 @@ python src/main.py --dry-run --headed
 
 - 電源オフ・完全シャットダウン中は送信されません
 - 最も確実なのは従来どおり **アプリを起動したまま＋スリープしない** 運用です
+
+## Vercel + 送信ワーカー（みんなで使う場合）
+
+管理画面を Vercel で公開し、**送信もブラウザから**行う構成です。
+
+| 役割 | ホスト |
+|------|--------|
+| 管理画面（登録・設定・送信ボタン） | Vercel |
+| データ保存（登録・設定） | Vercel Redis（`REDIS_URL` 等） |
+| Playwright 実行（実際の送信） | Railway 等の **送信ワーカー** |
+
+Vercel 単体ではブラウザ自動操作ができないため、`worker/` を別サーバーにデプロイします。
+
+### 1. Railway にワーカーをデプロイ
+
+1. [Railway](https://railway.app/) で GitHub リポジトリ `mitene` を Import
+2. **Root Directory** はリポジトリ直下のまま
+3. Railway が `worker/Dockerfile` を検出してビルド
+4. **Variables** に Vercel と同じ値を設定:
+   - `REDIS_URL`（または `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`）
+   - `MITENE_SECRET_KEY`（パスワード暗号化用・任意）
+   - `MITENE_WORKER_SECRET`（任意・推奨）
+5. デプロイ後の URL を控える（例: `https://mitene-worker.up.railway.app`）
+
+### 2. Vercel にワーカー URL を設定
+
+Vercel → プロジェクト `mitene` → **Settings → Environments**（環境変数）:
+
+| 名前 | 値 |
+|------|-----|
+| `MITENE_WORKER_URL` | Railway の URL（末尾スラッシュなし） |
+| `MITENE_WORKER_SECRET` | Railway と同じ秘密文字列（設定した場合） |
+
+設定後 **Redeploy**。
+
+### 3. 動作確認
+
+- 管理画面の黄色・青い警告が消える
+- 「今すぐ送信」でエラーにならない
 
 ## 注意
 

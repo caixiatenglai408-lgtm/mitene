@@ -14,5 +14,5 @@ if not exist "%PYTHON%" (
 "%PYTHON%" scripts\ensure_playwright_browsers.py
 
 echo.
-echo 完了しました。次に「ブラウザで開く.bat」で起動してください。
+echo Done. Next run open-browser.bat
 pause

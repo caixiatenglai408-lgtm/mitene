@@ -89,6 +89,108 @@
 
   const post = (url) => fetch(url, { method: "POST" }).then((r) => r.json());
 
+  function updateListCounts() {
+    const cards = document.querySelectorAll("#account-list .account-card");
+    const total = cards.length;
+    let enabled = 0;
+    cards.forEach((card) => {
+      const toggle = card.querySelector(".btn-toggle-auto");
+      const edit = card.querySelector(".btn-edit");
+      const isEnabled = (toggle || edit)?.dataset.enabled !== "false";
+      if (isEnabled) enabled += 1;
+    });
+    const accountsHint = document.getElementById("accounts-count-hint");
+    const enabledHint = document.getElementById("enabled-count-hint");
+    const title = document.getElementById("account-list-title");
+    if (accountsHint) accountsHint.textContent = String(total);
+    if (enabledHint) enabledHint.textContent = String(enabled);
+    if (title) title.textContent = `登録一覧（${total}名）`;
+    const empty = document.getElementById("account-list-empty");
+    if (empty) empty.hidden = total > 0;
+  }
+
+  function updateAccountEnabledUi(accountId, enabled, loginId) {
+    const card = document.querySelector(
+      `.account-card[data-account-id="${CSS.escape(accountId)}"]`
+    );
+    if (!card) return;
+
+    const toggleBtn = card.querySelector(".btn-toggle-auto");
+    const editBtn = card.querySelector(".btn-edit");
+    const login = loginId || editBtn?.dataset.login || "";
+
+    if (toggleBtn) {
+      toggleBtn.dataset.enabled = enabled ? "true" : "false";
+      toggleBtn.textContent = enabled
+        ? "自動送信対象外にする"
+        : "自動送信対象にする";
+      toggleBtn.classList.toggle("btn-toggle-auto-off", !enabled);
+    }
+    if (editBtn) {
+      editBtn.dataset.enabled = enabled ? "true" : "false";
+    }
+
+    const meta = card.querySelector(".account-meta:not(.account-meta--status)");
+    if (meta && login) {
+      meta.textContent = enabled ? login : `${login} · 自動送信対象外`;
+    }
+
+    const statusMeta = card.querySelector(".account-meta--status");
+    if (statusMeta) {
+      statusMeta.hidden = enabled;
+    } else if (!enabled && card.classList.contains("account-card--register")) {
+      const body = card.querySelector(".account-card-body");
+      if (body && !card.querySelector(".account-meta--status")) {
+        const span = document.createElement("span");
+        span.className = "hint account-meta account-meta--status";
+        span.textContent = "自動送信対象外";
+        const nameEl = body.querySelector(".account-name");
+        if (nameEl?.nextSibling) {
+          body.insertBefore(span, nameEl.nextSibling);
+        } else {
+          body.appendChild(span);
+        }
+      }
+    }
+
+    updateListCounts();
+  }
+
+  function removeAccountCard(accountId) {
+    const card = document.querySelector(
+      `.account-card[data-account-id="${CSS.escape(accountId)}"]`
+    );
+    if (card) card.remove();
+
+    window.existingAccountsData = (window.existingAccountsData || []).filter(
+      (a) => a.id !== accountId
+    );
+
+    updateListCounts();
+    if (typeof window.applyAccountNameFilter === "function") {
+      window.applyAccountNameFilter();
+    }
+  }
+
+  async function syncAccountsAfterChange() {
+    if (window.MiteneSync?.pullForce) {
+      await window.MiteneSync.pullForce();
+      return;
+    }
+    try {
+      const res = await fetch("/api/data", { cache: "no-store" });
+      const data = await res.json();
+      if (!data.ok) return;
+      if (window.MiteneSync?.applyData) {
+        window.MiteneSync.applyData(data);
+      } else {
+        window.MiteneAttendance?.applyAttendanceLists(data);
+      }
+    } catch (_) {
+      /* 表示はローカル更新済み */
+    }
+  }
+
   function setRunStatus(running, message, isError, elapsedSec) {
     if (window.MiteneRunUI) {
       window.MiteneRunUI.setRunStatus({
@@ -103,11 +205,103 @@
     const status = document.getElementById("run-status");
     if (!status) return;
     status.hidden = !message;
-    status.className = "run-status " + (isError ? "err" : running ? "running" : "ok");
+    status.className =
+      "run-status " + (isError ? "err" : running ? "running" : "ok");
     status.textContent = message || "";
   }
 
   const accountList = document.getElementById("account-list");
+  const runListSelector = "#account-list, #working-today-list, #off-today-list";
+
+  document.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".btn-run");
+    if (!btn) return;
+    const listRoot = btn.closest(runListSelector);
+    if (!listRoot) return;
+
+    const ui = window.MiteneRunUI;
+    if (ui?.isJobRunning?.()) {
+      alert("すでに実行中です。完了を待ってから再度お試しください。");
+      return;
+    }
+
+    if (!confirm(`「${btn.dataset.name}」でミテネを送信しますか？`)) return;
+    window.MiteneSync?.pause(60000);
+    const accountName = btn.dataset.name;
+    const accountId = btn.dataset.id;
+    const poll = window.MiteneRunPoll;
+    ui?.clearManualResult();
+
+    const runningLabel = `「${accountName}」送信中…`;
+
+    try {
+      const res = await fetch(`/api/run-account/${accountId}`, {
+        method: "POST",
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data.error || `エラー (${res.status})`);
+      }
+
+      const jobId = data.job_id;
+      if (!jobId) {
+        throw new Error("ジョブIDを取得できませんでした");
+      }
+
+      ui?.setActiveJob?.(jobId);
+      ui?.setRunStatus?.({
+        running: true,
+        message: runningLabel,
+        elapsedSec: 0,
+      });
+
+      poll?.watchJob(jobId, {
+        runningLabel,
+        sendMode: "single",
+        accountName,
+        onProgress(job) {
+          window.MiteneRunProgress?.apply(job);
+          window.MiteneRunProgress?.applyAccountRows?.(job);
+          const partial = job.partial_display;
+          if (partial && (partial.completed?.length || partial.errors?.length)) {
+            window.MiteneRunResults?.render(
+              partial,
+              document.getElementById("manual-run-result")
+            );
+          }
+        },
+        onStatus(opts) {
+          ui?.setRunStatus({
+            ...opts,
+            running: true,
+            message: opts.message || runningLabel,
+            elapsedSec: opts.elapsedSec,
+          });
+        },
+        onDone(job) {
+          ui?.finalizeJob?.(job, `「${accountName}」の結果`);
+        },
+        onError(message) {
+          ui?.clearActiveJob?.();
+          window.MiteneRunProgress?.clear?.();
+          ui?.setRunStatus({
+            running: false,
+            isError: true,
+            message,
+          });
+        },
+      });
+    } catch (err) {
+      ui?.clearActiveJob?.();
+      ui?.setRunStatus({
+        running: false,
+        isError: true,
+        message: err.message || "通信エラー",
+      });
+    }
+  });
+
   if (accountList) {
     accountList.addEventListener("click", async (e) => {
       const btn = e.target.closest("button");
@@ -123,64 +317,6 @@
         return;
       }
 
-      if (btn.classList.contains("btn-run")) {
-        if (!confirm(`「${btn.dataset.name}」でミテネを送信しますか？`)) return;
-        window.MiteneSync?.pause(60000);
-        const ui = window.MiteneRunUI;
-        const accountName = btn.dataset.name;
-        ui?.clearManualResult();
-        btn.disabled = true;
-
-        const stopElapsed = ui?.createElapsedTicker((sec) => {
-          ui.setRunStatus({
-            running: true,
-            message: `「${accountName}」送信中…`,
-            elapsedSec: sec,
-          });
-        });
-
-        try {
-          const res = await fetch(`/api/run-account/${btn.dataset.id}`, {
-            method: "POST",
-          });
-          const data = await res.json().catch(() => ({}));
-          stopElapsed?.();
-
-          if (!res.ok) {
-            ui?.setRunStatus({
-              running: false,
-              isError: true,
-              message: data.error || `エラー (${res.status})`,
-            });
-            return;
-          }
-
-          const result = data.result || {};
-          const display = ui?.displayFromAccountResult(result, accountName);
-          const hasIssues = display?.has_issues;
-
-          ui?.setRunStatus({
-            running: false,
-            phase: "done",
-            isError: hasIssues,
-            message: display?.summary || result.message || "処理が終わりました",
-          });
-          if (display) {
-            ui.renderManualResult(display, `「${accountName}」の結果`);
-          }
-        } catch (e) {
-          stopElapsed?.();
-          ui?.setRunStatus({
-            running: false,
-            isError: true,
-            message: e.message || "通信エラー",
-          });
-        } finally {
-          btn.disabled = false;
-        }
-        return;
-      }
-
       if (btn.classList.contains("btn-toggle-auto")) {
         window.MiteneSync?.pause(6000);
         const enabled = btn.dataset.enabled !== "true";
@@ -189,16 +325,26 @@
           : "自動送信の対象外にします（一覧には残ります）";
         if (!confirm(`「${btn.dataset.name}」を${action}\n\n・「今すぐ送信」は引き続き使えます`)) return;
 
-        const res = await fetch(`/api/accounts/${btn.dataset.id}/enabled`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-          window.MiteneSync?.pull();
-        } else {
-          alert(data.error || "更新に失敗しました");
+        btn.disabled = true;
+        try {
+          const res = await fetch(`/api/accounts/${btn.dataset.id}/enabled`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled }),
+          });
+          const data = await res.json();
+          if (data.ok) {
+            updateAccountEnabledUi(
+              btn.dataset.id,
+              data.enabled,
+              btn.dataset.login
+            );
+            syncAccountsAfterChange();
+          } else {
+            alert(data.error || "更新に失敗しました");
+          }
+        } finally {
+          btn.disabled = false;
         }
         return;
       }
@@ -211,13 +357,20 @@
         );
         if (!ok) return;
 
-        const res = await fetch(`/api/accounts/${btn.dataset.id}`, { method: "DELETE" });
-        const data = await res.json();
-        if (data.ok) {
-          alert(data.message);
-          window.MiteneSync?.pull();
-        } else {
-          alert(data.error || "削除に失敗しました");
+        btn.disabled = true;
+        try {
+          const res = await fetch(`/api/accounts/${btn.dataset.id}`, {
+            method: "DELETE",
+          });
+          const data = await res.json();
+          if (data.ok) {
+            removeAccountCard(btn.dataset.id);
+            syncAccountsAfterChange();
+          } else {
+            alert(data.error || "削除に失敗しました");
+          }
+        } finally {
+          btn.disabled = false;
         }
       }
     });

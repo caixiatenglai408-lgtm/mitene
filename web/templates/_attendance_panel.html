@@ -1,0 +1,49 @@
+<section class="card" id="attendance-section">
+  <h2>本日の出勤（{{ attendance_label }}）</h2>
+  <p class="hint">
+    登録一覧の「出勤」にチェックを入れた女の子を<strong>優先</strong>して送信します。
+    チェックしていない女の子はその後に送信されます（「今すぐ全員送信」も同じ順序）。
+  </p>
+
+  <div class="attendance-block attendance-block--working">
+    <div class="attendance-block-head">
+      <div class="attendance-block-title">
+        <span class="attendance-badge attendance-badge--working">出勤</span>
+        <h3>本日出勤の女の子 <span class="attendance-count" id="working-count-hint">{{ working_today|length }}</span>名</h3>
+      </div>
+      <button type="button" id="btn-run-working" class="btn-primary btn-attendance-run">出勤の女の子を送信</button>
+    </div>
+    <p id="working-today-empty" class="attendance-empty hint" {% if working_today %}hidden{% endif %}>チェックした女の子がここに表示されます。</p>
+    <ul class="attendance-list" id="working-today-list">
+      {% for a in working_today %}
+      <li class="attendance-row" data-account-id="{{ a.id }}" data-account-name="{{ a.name }}">
+        <div class="attendance-row-info">
+          <span class="attendance-row-name">{{ a.name }}</span>
+        </div>
+        <button type="button" class="btn-primary btn-run btn-run-sm" data-id="{{ a.id }}" data-name="{{ a.name }}">今すぐ送信</button>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="attendance-block attendance-block--off">
+    <div class="attendance-block-head">
+      <div class="attendance-block-title">
+        <span class="attendance-badge attendance-badge--off">お休み</span>
+        <h3>お休みの女の子 <span class="attendance-count" id="off-count-hint">{{ off_today|length }}</span>名</h3>
+      </div>
+      <button type="button" id="btn-run-off" class="btn-secondary btn-attendance-run">お休みの女の子を送信</button>
+    </div>
+    <p id="off-today-empty" class="attendance-empty hint" {% if off_today %}hidden{% endif %}>チェックしていない女の子がここに表示されます。</p>
+    <ul class="attendance-list" id="off-today-list">
+      {% for a in off_today %}
+      <li class="attendance-row" data-account-id="{{ a.id }}" data-account-name="{{ a.name }}">
+        <div class="attendance-row-info">
+          <span class="attendance-row-name">{{ a.name }}</span>
+        </div>
+        <button type="button" class="btn-primary btn-run btn-run-sm" data-id="{{ a.id }}" data-name="{{ a.name }}">今すぐ送信</button>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>

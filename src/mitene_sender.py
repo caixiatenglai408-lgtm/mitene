@@ -5,14 +5,16 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import os
 import random
 import re
 import time
-from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse, urlunparse
+import traceback
+from dataclasses import dataclass, field
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from human_behavior import HumanBehavior
 from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwright, sync_playwright
@@ -20,16 +22,16 @@ from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwrig
 logger = logging.getLogger(__name__)
 
 # 管理画面表示用（送信ルールの識別）
-SEND_LOGIC_VERSION = "login-retry-v4.5"
+SEND_LOGIC_VERSION = "cta-click-modal-confirm"
 
 # 会員一覧ホスト（gid=女の子ID をクエリに付与）
 SPGIRL_LIST_HOST = "spgirl.cityheaven.net"
 # 正規ログインURL（J1Main.php 等ではなく明示的に J1Login.php を開く）
 SPGIRL_LOGIN_URL = "https://spgirl.cityheaven.net/J1Login.php"
-# ログイン画面を開く前の待機（秒）— 連続アクセスによる IP ブロック防止
-LOGIN_PRE_OPEN_WAIT_SEC = (3, 5)
-# ログイン送信後の待機（秒）— ページが安定するまでしっかり待つ
-LOGIN_POST_SUBMIT_WAIT_SEC = 5
+# ログイン画面を開く前の待機（秒）
+LOGIN_PRE_OPEN_WAIT_SEC = (2, 2)
+# ログイン送信後の待機（秒）— ページが安定するまで
+LOGIN_POST_SUBMIT_WAIT_SEC = 2
 # ログイン失敗時の再試行前待機（ミリ秒）— 通常の再試行
 LOGIN_RETRY_WAIT_MS = 30000
 # SSL / chrome-error 等の一時ブロック検知時の待機（ミリ秒）
@@ -48,20 +50,35 @@ STEP_TAB_MARKERS: dict[str, dict[str, Any]] = {
     },
     "キープ": {
         "slug": "comeonkeeplist",
-        "headings": ("キープしている会員", "キープ会員", "キープした会員"),
+        "headings": (
+            "あなたをキープした会員",
+            "キープしている会員",
+            "キープ会員",
+            "キープした会員",
+        ),
     },
     "マッチ率": {
         "slug": "comeonaimatchinglist",
-        "headings": ("AIマッチング", "相性の良い会員", "マッチ率の高い"),
+        "headings": (
+            "マッチ率が高い会員",
+            "マッチ率の高い",
+            "AIマッチング",
+            "相性の良い会員",
+        ),
     },
 }
 
-# 全角数字・コロン、改行挟み、「20回」「残り回数 : 20 / 20」にも対応
-REMAINING_PATTERN = re.compile(
-    r"ミテネ残り回数\s*[：:：]?\s*([0-9０-９]+)\s*回?"
-    r"|残り回数\s*[：:]\s*([0-9０-９]+)\s*/\s*[0-9０-９]+",
+# 全角数字・コロン、改行挟み、「20回」にも対応（本文全体では findall + max で誤った 0 を避ける）
+MITENE_REMAINING_PATTERN = re.compile(
+    r"ミテネ残り回数\s*[：:：]?\s*([0-9０-９]+)\s*回?",
     re.MULTILINE,
 )
+# CTA 付近のブロック内のみ。「残り回数 : 20 / 20」形式のフォールバック用
+REMAINING_SLASH_PATTERN = re.compile(
+    r"残り回数\s*[：:]\s*([0-9０-９]+)\s*/\s*([0-9０-９]+)",
+    re.MULTILINE,
+)
+# 後方互換（他モジュールから参照される場合）
 # ミテネ！Pick Up 画面の横タブ（2枚目の赤枠）
 PICKUP_TAB_LABELS = ("みたよ", "マイガール", "口コミ", "キープ", "マッチ率", "ミテネ履歴")
 # ミテネ履歴の値に日付・送信済がある = すでに送った会員
@@ -99,11 +116,6 @@ class LoginConfig:
 
 
 # 姫デコ会員一覧の「ミテネを送る」CTA（DevTools: kitene_send_btn / registComeon）
-KITENE_SEND_CTA_SELECTOR = (
-    ".kitene_send_btn.active a.kitene_send_btn__text_wrapper, "
-    "a.kitene_send_btn__text_wrapper[onclick*='registComeon'], "
-    "a[onclick^='registComeon']"
-)
 
 # 会員カード検出（固定セレクタ + 送信ボタン/js-regist_comeon から親を辿る）
 MEMBER_CARD_HELPERS_JS = """
@@ -188,7 +200,33 @@ const collectMemberCards = () => {
             }
         }
     }
-    return cards;
+    return pruneNestedCards(cards);
+};
+const pruneNestedCards = (cards) => {
+    if (cards.length < 2) return cards;
+    return cards.filter((card, i) => {
+        for (let j = 0; j < cards.length; j++) {
+            if (i === j) continue;
+            try {
+                if (cards[j] !== card && cards[j].contains(card)) return false;
+            } catch (_) {}
+        }
+        return true;
+    });
+};
+const countSelectorHits = () => {
+    const hits = {};
+    let total = 0;
+    for (const sel of MEMBER_CARD_ROOT_SELECTORS) {
+        try {
+            const n = document.querySelectorAll(sel).length;
+            hits[sel] = n;
+            total += n;
+        } catch (_) {
+            hits[sel] = -1;
+        }
+    }
+    return { hits, total };
 };
 const memberCardSelectorDebug = () => {
     const cards = collectMemberCards();
@@ -341,44 +379,173 @@ MEMBER_CARD_PARSE_JS = (
         return m ? m[1] : '';
     };
     const hasSendButton = (card) => {
+        const wrap = card.querySelector('.kitene_send_btn');
+        if (wrap && !wrap.classList.contains('kitene_send_zumi_btn')) {
+            const zumi = wrap.querySelector('.kitene_send_zumi_btn');
+            let zumiVisible = false;
+            if (zumi) {
+                const zs = getComputedStyle(zumi);
+                zumiVisible = zs.display !== 'none' && zs.visibility !== 'hidden'
+                    && zumi.offsetParent;
+            }
+            const wt = (wrap.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (!zumiVisible && /ミテネ/.test(wt) && !wt.includes('送信済')) {
+                const r = wrap.getBoundingClientRect();
+                if (r.width >= 40 && r.height >= 16 && wrap.offsetParent) return true;
+            }
+        }
         for (const el of card.querySelectorAll(
             '.kitene_send_btn, a, button, [onclick*="registComeon"]'
         )) {
             if (el.closest('.kitene_send_zumi_btn')) continue;
-            const raw = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-            if (!/ミテネを送る|ミテネする|ミテネ送る/.test(raw)) continue;
-            if (raw.length > 60) continue;
+            const raw = (el.innerText || el.getAttribute('value')
+                || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+            if (!/ミテネを送る|ミテネする|ミテネ送る|ミテネ/.test(raw)) continue;
+            if (raw.includes('送信済')) continue;
+            if (raw.length > 80) continue;
             const r = el.getBoundingClientRect();
             if (r.width < 40 || r.height < 16 || !el.offsetParent) continue;
             return true;
         }
         return false;
     };
-    const nodes = collectMemberCards();
-    const out = [];
-    const seen = new Set();
-    for (const card of nodes) {
-        const cardText = (card.innerText || '').trim();
-        const cardHtmlHead = (card.innerHTML || '').slice(0, 500);
+    const extractMidDeep = (card) => {
+        const tryRoot = (root) => {
+            if (!root) return '';
+            for (const el of root.querySelectorAll(
+                '[class*="js-regist_comeon_"], [onclick*="registComeon"]'
+            )) {
+                if (el.classList) {
+                    for (const c of el.classList) {
+                        if (c.startsWith('js-regist_comeon_')) {
+                            return c.replace('js-regist_comeon_', '');
+                        }
+                    }
+                }
+                const oc = el.getAttribute('onclick') || '';
+                const m = oc.match(/registComeon\\((\\d+)\\)/);
+                if (m) return m[1];
+            }
+            return extractUid(root);
+        };
+        let found = tryRoot(card);
+        if (found) return found;
+        let node = card.parentElement;
+        for (let d = 0; d < 4 && node && node !== document.body; d++, node = node.parentElement) {
+            found = tryRoot(node);
+            if (found) return found;
+        }
+        return '';
+    };
+    const cardDataScore = (data) => {
+        let score = (data.historyText || '').length * 10;
+        score += (data.name || '').length;
+        if (data.hasSendButton) score += 50;
+        score += (data.cardText || '').length;
+        if (data.mid || data.uid) score += 100;
+        return score;
+    };
+    const buildCardData = (card) => {
         const uid = extractUid(card);
-        const mid = extractMid(card);
-        const dedupe = mid || uid;
-        if (dedupe && seen.has(dedupe)) continue;
-        if (dedupe) seen.add(dedupe);
-        out.push({
+        const mid = extractMidDeep(card);
+        return {
             name: extractName(card),
             uid,
             mid,
-            cardText,
-            cardHtmlHead,
+            cardText: (card.innerText || '').trim(),
+            cardHtmlHead: (card.innerHTML || '').slice(0, 500),
+            cardOuterHtmlHead: (card.outerHTML || '').slice(0, 500),
             historyText: readHistory(card),
             matchRate: readMatchRate(card),
             hasSendButton: hasSendButton(card),
-        });
+        };
+    };
+    const selectorInfo = countSelectorHits();
+    const rawBeforePrune = (() => {
+        const cards = [];
+        const seen = new Set();
+        const add = (el) => {
+            if (!el || seen.has(el) || !isLikelyMemberCard(el)) return;
+            seen.add(el);
+            cards.push(el);
+        };
+        for (const sel of MEMBER_CARD_ROOT_SELECTORS) {
+            try { document.querySelectorAll(sel).forEach(add); } catch (_) {}
+        }
+        for (const sel of MEMBER_CARD_ANCHOR_SELECTORS) {
+            let anchors = [];
+            try { anchors = [...document.querySelectorAll(sel)]; } catch (_) { continue; }
+            for (const anchor of anchors) {
+                if (anchor.closest('.kitene_send_zumi_btn')) continue;
+                let node = anchor;
+                for (let depth = 0; depth < 14 && node; depth++, node = node.parentElement) {
+                    if (!node || node === document.body) break;
+                    if (isLikelyMemberCard(node)) { add(node); break; }
+                }
+            }
+        }
+        return cards;
+    })();
+    const nodes = pruneNestedCards(rawBeforePrune);
+    const stats = {
+        selectorHits: selectorInfo.hits,
+        selectorHitsTotal: selectorInfo.total,
+        querySelectorAllNodes: selectorInfo.total,
+        rawNodesBeforePrune: rawBeforePrune.length,
+        nodesAfterPrune: nodes.length,
+        nestedPruned: Math.max(0, rawBeforePrune.length - nodes.length),
+        duplicateIdMerged: 0,
+        noMemberId: 0,
+        nameMissing: 0,
+        historyMissing: 0,
+        recoveredFromParent: 0,
+    };
+    const byId = new Map();
+    const noIdCards = [];
+    for (const card of nodes) {
+        const data = buildCardData(card);
+        const dedupe = data.mid || data.uid;
+        if (!dedupe) {
+            stats.noMemberId++;
+            noIdCards.push({ card, data });
+            continue;
+        }
+        if (!data.name || data.name === '（名前不明）') stats.nameMissing++;
+        if (!data.historyText) stats.historyMissing++;
+        const existing = byId.get(dedupe);
+        if (existing) {
+            stats.duplicateIdMerged++;
+            if (cardDataScore(data) > cardDataScore(existing)) {
+                byId.set(dedupe, data);
+            }
+        } else {
+            byId.set(dedupe, data);
+        }
     }
-    return out;
+    for (const item of noIdCards) {
+        let node = item.card.parentElement;
+        for (let d = 0; d < 5 && node && node !== document.body; d++, node = node.parentElement) {
+            const recovered = buildCardData(node);
+            const dedupe = recovered.mid || recovered.uid;
+            if (!dedupe) continue;
+            stats.recoveredFromParent++;
+            stats.noMemberId = Math.max(0, stats.noMemberId - 1);
+            const existing = byId.get(dedupe);
+            if (!existing || cardDataScore(recovered) > cardDataScore(existing)) {
+                byId.set(dedupe, recovered);
+            }
+            break;
+        }
+    }
+    const out = [...byId.values()];
+    stats.uniqueMemberIds = out.length;
+    stats.finalCards = out.length;
+    return { cards: out, stats };
 }"""
 )
+
+# キープ / マッチ率専用（Pick Up 横タブ・プロフィール型 tab=4/5 対応）
+# ※ みたよ用の user_ranking 一括走査は使わない
 
 # タブ名 → 会員一覧URL（gid は login_id で付与）
 TAB_LIST_PATHS: dict[str, str] = {
@@ -388,10 +555,6 @@ TAB_LIST_PATHS: dict[str, str] = {
     "みたよ": "/J10ComeonVisitorList.php",
 }
 
-def build_tab_list_url(gid: str, tab: str, *, host: str = SPGIRL_LIST_HOST) -> str:
-    """女の子ID付きの会員一覧URL（例: gid=39760216）."""
-    path = TAB_LIST_PATHS.get(tab, "")
-    return build_list_url(gid, path, host=host)
 
 
 def build_list_url(
@@ -414,6 +577,34 @@ def is_new_member_from_history(history_text: str) -> bool:
     return "送信済" not in (history_text or "")
 
 
+def member_queue_key(member_id: str) -> str:
+    return f"comeon-{(member_id or '').strip()}"
+
+
+@dataclass
+class Member:
+    """送信対象抽出結果（Locator / ElementHandle は保持しない）."""
+
+    member_id: str
+    name: str
+    has_send_button: bool
+    sent_history: bool = False
+    last_sent: date | None = None
+
+
+@dataclass
+class SendPhaseRecord:
+    """1送信フェーズ分のキューと試行結果（照合用）."""
+
+    label: str
+    queued_ids: list[str]
+    index: int = 0
+    success: list[str] = field(default_factory=list)
+    failed: dict[str, str] = field(default_factory=dict)
+    skipped: dict[str, str] = field(default_factory=dict)
+    attempted: list[str] = field(default_factory=list)
+
+
 @dataclass
 class PriorityStep:
     tab: str
@@ -426,7 +617,7 @@ class PriorityStep:
 
 # 送信順（config 未設定時の既定）
 # ①マイガール(新規) → ②キープ(新規) → ③マッチ率(新規・残り回数) →
-# ④みたよ(マッチ率新規0件時のみ) → ⑤マイガール(送信日古い順)
+# ④マイガール（古い順）→ ⑤みたよ(マッチ率新規0件時のみ) → ⑥キープ → ⑦マッチ率（古い順）
 DEFAULT_PRIORITY_STEPS: list[PriorityStep] = [
     PriorityStep(
         tab="マイガール",
@@ -444,24 +635,32 @@ DEFAULT_PRIORITY_STEPS: list[PriorityStep] = [
         list_path="/J10ComeonAiMatchingList.php",
     ),
     PriorityStep(
+        tab="マイガール",
+        member_filter="sent_oldest_first",
+        list_path="/J10ComeonMyGirlList.php",
+    ),
+    PriorityStep(
         tab="みたよ",
         condition="if_no_match_new",
         member_filter="sendable",
         list_path="/J10ComeonVisitorList.php",
     ),
     PriorityStep(
-        tab="マイガール",
+        tab="キープ",
         member_filter="sent_oldest_first",
-        list_path="/J10ComeonMyGirlList.php",
+        list_path="/J10ComeonKeepList.php",
+    ),
+    PriorityStep(
+        tab="マッチ率",
+        member_filter="sent_oldest_first",
+        list_path="/J10ComeonAiMatchingList.php",
     ),
 ]
 
-# 新規0件フォールバック: 全タブの会員を合算して送信日古い順に送る
-AGGREGATE_LIST_TABS: tuple[tuple[str, str], ...] = (
-    ("マイガール", "/J10ComeonMyGirlList.php"),
-    ("キープ", "/J10ComeonKeepList.php"),
-    ("マッチ率", "/J10ComeonAiMatchingList.php"),
-    ("みたよ", "/J10ComeonVisitorList.php"),
+# ⑥〜⑦: キープ・マッチ率を送信日古い順に巡回（④マイガールはフェーズ1後に個別実行）
+OLDEST_FIRST_PHASE_TABS: tuple[tuple[str, str, str], ...] = (
+    ("⑥キープ（古い順）", "キープ", "/J10ComeonKeepList.php"),
+    ("⑦マッチ率（古い順）", "マッチ率", "/J10ComeonAiMatchingList.php"),
 )
 
 # 一覧URL遷移後に DOM が安定するまで待つセレクタ
@@ -483,12 +682,163 @@ LIST_URL_FIXED_EXTRA_MS = 1000
 LIST_URL_FIX_TIMEOUT_MS = 10000
 # 最終強制 goto 後の待機（ミリ秒）
 FINAL_FORCED_WAIT_MS = 3000
+# 直打ちリトライ回数（ループ内）
+LIST_NAV_ATTEMPTS = 3
+# 一覧 Ajax 遅延読込待ち（ミリ秒）
+LIST_AJAX_LOAD_WAIT_MS = (2000, 3000)
+# scrollHeight / カード数 / uniqueMemberIds が変化しない連続回数
+LIST_SCROLL_STABLE_ROUNDS = 4
+# スクロール→解析→マージの最大ループ回数
+LIST_SCROLL_PARSE_MAX_ROUNDS = 150
+
+# 一覧到達後の会員カード表示待機（全タブ共通・Ajax 遅延読込対策）
+MEMBER_CARD_WAIT_SELECTORS: tuple[str, ...] = (
+    "li.user_ranking_box",
+    ".user_ranking_list > li",
+    ".user_ranking_list li",
+    "ul.user_ranking_list li",
+    ".user_ranking_box",
+)
+LIST_RENDER_POLL_MS = 500
+LIST_RENDER_WAIT_MAX_MS = 8000
+LIST_ZERO_RETRY_WAIT_MS = 3000
+
+
+LIST_LOADING_GONE_JS = """
+() => {
+    const loadingSelectors = [
+        '.loading', '#loading', '[class*="loading"]', '[class*="Loading"]',
+        '.loader', '#loader', '[class*="loader"]',
+        '.now_loading', '#now_loading', '.kitene_loading',
+        '.spinner', '[class*="spinner"]', '[id*="loading"]',
+    ];
+    for (const sel of loadingSelectors) {
+        let nodes;
+        try { nodes = document.querySelectorAll(sel); } catch (_) { continue; }
+        for (const el of nodes) {
+            const s = getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden') continue;
+            const r = el.getBoundingClientRect();
+            if (r.width >= 10 && r.height >= 10
+                && (el.offsetParent || s.position === 'fixed')) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+"""
+
+TAB_MEMBER_TOTAL_PATTERNS: dict[str, re.Pattern[str]] = {
+    "マイガール": re.compile(r"現在のマイガール数\s*[:：]?\s*([\d,，]+)"),
+    "キープ": re.compile(r"現在のキープ数\s*[:：]?\s*([\d,，]+)"),
+    "みたよ": re.compile(r"現在のみたよ数\s*[:：]?\s*([\d,，]+)"),
+}
 # ログ表示用
 LIST_PAGE_STABILIZE_MS = LIST_GOTO_SETTLE_MS + LIST_URL_FIXED_EXTRA_MS
 # マイガールタブクリック後の待機（ミリ秒）— 直URL拒否のためキープ経由
 MYGIRL_TAB_CLICK_WAIT_MS = 3000
 KEEP_LIST_PATH = "/J10ComeonKeepList.php"
 MYGIRL_LIST_PATH = "/J10ComeonMyGirlList.php"
+# List.php 直打ち後に J1GirlUserPage?tab=N へ飛ぶアカウント向け
+STEP_PROFILE_TAB: dict[str, str] = {
+    "マイガール": "3",
+    "キープ": "4",
+    "マッチ率": "5",
+}
+MAX_PROFILE_TAB_MEMBERS = 50
+PROFILE_MEMBER_PARSE_JS = """
+(historyLabel) => {
+    const uid = new URL(location.href).searchParams.get('uid') || '';
+    let mid = uid;
+    for (const el of document.querySelectorAll(
+        '[class*="js-regist_comeon_"], [onclick*="registComeon"]'
+    )) {
+        for (const c of el.classList || []) {
+            if (c.startsWith('js-regist_comeon_')) {
+                mid = c.replace('js-regist_comeon_', '');
+                break;
+            }
+        }
+        const oc = el.getAttribute('onclick') || '';
+        const m = oc.match(/registComeon\\((\\d+)\\)/);
+        if (m) { mid = m[1]; break; }
+    }
+    let historyText = '';
+    const box = document.querySelector('.kitene_question')
+        || document.querySelector('.kitene_question_box');
+    const scope = box || document.body;
+    for (const li of scope.querySelectorAll('li')) {
+        const q = (li.querySelector('.question')?.innerText || '').trim();
+        if (!q.includes(historyLabel)) continue;
+        historyText = (
+            li.querySelector('.answer.compatibility')?.innerText
+            || li.querySelector('.answer')?.innerText
+            || ''
+        ).trim();
+        break;
+    }
+    let hasSendButton = false;
+    for (const el of document.querySelectorAll(
+        '.kitene_send_btn, a, button, [onclick*="registComeon"]'
+    )) {
+        if (el.closest('.kitene_send_zumi_btn')) continue;
+        const raw = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+        if (!/ミテネを送る|ミテネする|ミテネ送る/.test(raw)) continue;
+        if (raw.length > 60) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 40 || r.height < 16 || !el.offsetParent) continue;
+        hasSendButton = true;
+        break;
+    }
+    const cardText = (scope.innerText || document.body.innerText || '').slice(0, 2500);
+    let matchRate = '';
+    const mr = cardText.match(/マッチ(?:ング)?率\\s*[:：]?\\s*(\\d+\\s*%)/);
+    if (mr) matchRate = mr[1];
+    return { uid, mid, historyText, hasSendButton, cardText, matchRate };
+}
+"""
+PROFILE_UID_COLLECT_JS = """
+(tabParam) => {
+    const ids = [];
+    const seen = new Set();
+    const add = (id) => {
+        id = String(id || '').trim();
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        ids.push(id);
+    };
+    add(new URL(location.href).searchParams.get('uid'));
+    for (const el of document.querySelectorAll('[onclick*="registComeon"]')) {
+        const oc = el.getAttribute('onclick') || '';
+        const m = oc.match(/registComeon\\((\\d+)\\)/);
+        if (m) add(m[1]);
+    }
+    for (const el of document.querySelectorAll('[class*="js-regist_comeon_"]')) {
+        for (const c of el.classList || []) {
+            if (c.startsWith('js-regist_comeon_')) {
+                add(c.replace('js-regist_comeon_', ''));
+            }
+        }
+    }
+    for (const a of document.querySelectorAll(
+        'a[href*="girluserpage"], a[href*="GirlUserPage"], a[href*="uid="]'
+    )) {
+        const href = (a.getAttribute('href') || '').toLowerCase();
+        if (tabParam && href.includes('tab=') && !href.includes('tab=' + tabParam)) {
+            continue;
+        }
+        const m = href.match(/[?&]uid=(\\d+)/);
+        if (m) add(m[1]);
+    }
+    for (const el of document.querySelectorAll('[class*="u_"]')) {
+        for (const c of el.classList || []) {
+            if (c.startsWith('u_') && c.length > 2) add(c.slice(2));
+        }
+    }
+    return ids;
+}
+"""
 # 履歴なし会員のソート用（送信日古い順で最優先グループ）
 OLDEST_SORT_DEFAULT_DATE = date(1970, 1, 1)
 
@@ -506,6 +856,9 @@ class MiteneStandardConfig:
     max_no_history_sends_per_day: int
     confirm_buttons: list[str]
     skip_special_banners: bool
+    member_extraction_debug: bool = False
+    # 調査用暫定: スクロール走査マージ解析（通常は false = 単回解析）
+    member_scroll_merge_parse: bool = False
 
 
 @dataclass
@@ -528,7 +881,10 @@ class BrowserConfig:
 
 
 class DailyLimitReached(Exception):
-    """送信可能回数が残っていない."""
+    """送信可能回数が残っていない（budget == 0 のときのみ）."""
+
+
+BUDGET_READ_FAILED_PREFIX = "ミテネ残り回数取得失敗"
 
 
 def _normalize_evaluate_rows(raw: Any) -> list[dict[str, Any]]:
@@ -557,6 +913,59 @@ def _member_dicts_only(members: list[Any]) -> list[dict[str, Any]]:
     return [m for m in members if isinstance(m, dict)]
 
 
+def _extract_card_parse_result(
+    raw: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """MEMBER_CARD_PARSE_JS の { cards, stats } または配列を正規化."""
+    if isinstance(raw, dict) and isinstance(raw.get("cards"), list):
+        stats = raw.get("stats")
+        cards = [x for x in raw["cards"] if isinstance(x, dict)]
+        return cards, stats if isinstance(stats, dict) else {}
+    return _normalize_evaluate_rows(raw), {}
+
+
+def _card_dict_richness(card: dict[str, Any]) -> int:
+    score = len(str(card.get("history_text") or "")) * 10
+    score += len(str(card.get("name") or ""))
+    if card.get("has_send_button"):
+        score += 50
+    score += len(str(card.get("inner_text") or ""))
+    return score
+
+
+def _merge_parse_stats(
+    agg: dict[str, Any], stats: dict[str, Any], *, scroll_pass: int
+) -> None:
+    if not stats:
+        return
+    passes = agg.setdefault("scroll_passes", [])
+    passes.append({"pass": scroll_pass, **stats})
+    for key in (
+        "nestedPruned",
+        "duplicateIdMerged",
+        "noMemberId",
+        "nameMissing",
+        "historyMissing",
+        "recoveredFromParent",
+    ):
+        if key in stats:
+            agg[key] = int(agg.get(key, 0)) + int(stats[key] or 0)
+    if "selectorHits" in stats and not agg.get("selectorHits"):
+        agg["selectorHits"] = stats["selectorHits"]
+    for field in (
+        "selectorHitsTotal",
+        "querySelectorAllNodes",
+        "rawNodesBeforePrune",
+        "nodesAfterPrune",
+    ):
+        if field in stats:
+            agg[field] = max(int(agg.get(field, 0)), int(stats[field] or 0))
+    agg["uniqueMemberIds"] = max(
+        int(agg.get("uniqueMemberIds", 0)),
+        int(stats.get("uniqueMemberIds") or stats.get("finalCards") or 0),
+    )
+
+
 class MiteneSender:
     def __init__(
         self,
@@ -573,6 +982,7 @@ class MiteneSender:
         screenshot_on_error: bool = True,
         dry_run: bool = False,
         human: HumanBehavior | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.login_id = login_id
@@ -587,6 +997,7 @@ class MiteneSender:
         self.screenshot_on_error = screenshot_on_error
         self.dry_run = dry_run
         self.human = human or HumanBehavior({"enabled": False})
+        self._progress_callback = progress_callback
         self._sent_log = self.log_dir / "sent_history.jsonl"
         self._member_send_log = self.log_dir / "member_sends.jsonl"
         self._sent_member_keys: set[str] = set()
@@ -598,13 +1009,41 @@ class MiteneSender:
         self._current_step: PriorityStep | None = None
         self._send_target: int = 0
         self._send_done: int = 0
+        self._locked_send_budget: int | None = None
         self._no_history_sent_today: int = 0
         self._match_rate_had_new: bool | None = None
         self._pipeline_had_new_member: bool = False
         self._cached_list_cards: list[dict[str, Any]] | None = None
         self._cached_list_url: str = ""
+        self._profile_uid_by_key: dict[str, str] = {}
         self._last_tab_parse_stats: dict[str, Any] = {}
+        self._debug_collect_duplicates: dict[str, list[Member]] = {}
+        self._debug_member_dom: dict[str, dict[str, str]] = {}
+        self._debug_member_names: dict[str, str] = {}
+        self._debug_run_sent_success: list[str] = []
+        self._debug_run_sent_failed: list[str] = []
+        self._debug_run_excluded: list[str] = []
+        self._debug_exclusion_logged: set[str] = set()
+        self._debug_parse_id_fail_count: int = 0
+        self._send_run_phases: list[SendPhaseRecord] = []
+        self._send_phase_tracker: SendPhaseRecord | None = None
+        self._last_send_attempt: dict[str, str] | None = None
         self._last_goto_access_block = False
+        self._last_nav_action: str = ""
+
+    def _set_nav_debug_action(self, action: str) -> None:
+        """framenavigated ログと突き合わせる直前操作の記録."""
+        self._last_nav_action = action
+
+    def _emit_send_progress(self, send_done: int, send_budget: int | None = None) -> None:
+        budget = send_budget if send_budget is not None else self._send_target
+        cb = self._progress_callback
+        if not cb or budget <= 0:
+            return
+        try:
+            cb(send_done, budget)
+        except Exception:
+            logger.debug("送信進捗コールバック失敗", exc_info=True)
 
     MITENE_ACTION_TEXTS = ("ミテネを送る", "ミテネする", "ミテネ送る")
 
@@ -637,16 +1076,16 @@ class MiteneSender:
         )
         try:
             if page is not None:
-                page.wait_for_timeout(LOGIN_ACCESS_BLOCK_WAIT_MS)
+                self._pause_ms(LOGIN_ACCESS_BLOCK_WAIT_MS)
                 return
         except Exception:
             pass
-        time.sleep(wait_sec)
+        self._pause_ms(int(wait_sec * 1000))
 
     def _wait_before_login_page(self) -> None:
         wait_sec = random.uniform(*LOGIN_PRE_OPEN_WAIT_SEC)
         logger.info("ログイン画面を開く前に %.1f 秒待機", wait_sec)
-        time.sleep(wait_sec)
+        self._pause_ms(int(wait_sec * 1000))
 
     def _wait_page_settled(self, page: Page, *, quick: bool = False) -> None:
         """画面遷移後に待つ（networkidle は使わない＝ずっと待ち続ける原因になりやすい）."""
@@ -654,7 +1093,7 @@ class MiteneSender:
             page.wait_for_load_state("domcontentloaded", timeout=8000 if quick else 12000)
         except Exception:
             pass
-        page.wait_for_timeout(80 if quick else 200)
+        self._pause_ms(80 if quick else 200)
 
     def _is_browser_error_page(self, page: Page) -> bool:
         url = (page.url or "").lower()
@@ -712,6 +1151,161 @@ class MiteneSender:
     def _is_member_profile_page(self, page: Page) -> bool:
         u = (page.url or "").lower()
         return "j1girluserpage" in u or "girluserpage" in u
+
+    def _url_query_param(self, page: Page, name: str) -> str:
+        try:
+            qs = parse_qs(urlparse(page.url or "").query)
+            return (qs.get(name, [""])[0] or "").strip()
+        except Exception:
+            return ""
+
+    def _is_step_profile_page(self, page: Page, step: PriorityStep) -> bool:
+        """J1GirlUserPage?tab=N が意図したタブ（キープ/マッチ率等）か."""
+        if not self._is_member_profile_page(page):
+            return False
+        expected = STEP_PROFILE_TAB.get(step.tab, "")
+        tab = self._url_query_param(page, "tab")
+        if expected and tab == expected:
+            return True
+        return self._is_step_tab_active(page, step)
+
+    def _goto_profile_tab(
+        self, page: Page, uid: str, step: PriorityStep
+    ) -> bool:
+        uid = (uid or "").strip()
+        if not uid:
+            return False
+        parsed = urlparse(page.url or "")
+        host = parsed.netloc or SPGIRL_LIST_HOST
+        scheme = parsed.scheme or "https"
+        path = parsed.path if "girluserpage" in parsed.path.lower() else "/J1GirlUserPage.php"
+        qs_parts = [f"uid={uid}"]
+        tab = STEP_PROFILE_TAB.get(step.tab, "")
+        if tab:
+            qs_parts.append(f"tab={tab}")
+        gid = self._gid()
+        if gid:
+            qs_parts.append(f"gid={gid}")
+        target = urlunparse(
+            (scheme, host, path, "", "&".join(qs_parts), "")
+        )
+        return self._safe_goto(page, target)
+
+    def _navigate_to_profile_member(
+        self, page: Page, member_id: str, step: PriorityStep
+    ) -> bool:
+        key = f"comeon-{member_id}"
+        uid = self._profile_uid_by_key.get(key) or member_id
+        current_uid = self._url_query_param(page, "uid")
+        btn = self._kitene_button_locator(page, member_id)
+        if (
+            current_uid == uid
+            and self._safe_count(btn) > 0
+            and self._safe_is_visible(btn.first)
+        ):
+            return True
+        if not self._goto_profile_tab(page, uid, step):
+            return False
+        self._pause_ms(700)
+        btn = self._kitene_button_locator(page, member_id)
+        return self._safe_count(btn) > 0 and self._safe_is_visible(btn.first)
+
+    def _collect_profile_tab_uids(
+        self, page: Page, step: PriorityStep
+    ) -> list[str]:
+        tab = STEP_PROFILE_TAB.get(step.tab, "")
+        try:
+            raw = page.evaluate(PROFILE_UID_COLLECT_JS, tab)
+        except Exception:
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [str(u).strip() for u in raw if str(u).strip()]
+
+    def _parse_single_profile_member(
+        self, page: Page
+    ) -> dict[str, Any] | None:
+        try:
+            raw = page.evaluate(
+                PROFILE_MEMBER_PARSE_JS,
+                {"historyLabel": self.standard.mitene_history_label},
+            )
+        except Exception as e:
+            logger.warning("プロフィール会員解析失敗: %s", e)
+            return None
+        if not isinstance(raw, dict):
+            return None
+        uid = str(raw.get("uid") or "").strip()
+        mid = str(raw.get("mid") or uid or "").strip()
+        if not mid:
+            return None
+        card_text = str(raw.get("cardText") or "")
+        history_text = str(raw.get("historyText") or "").strip()
+        key = f"comeon-{mid}"
+        if uid:
+            self._profile_uid_by_key[key] = uid
+        return {
+            "name": "（名前不明）",
+            "uid": uid,
+            "mid": mid,
+            "key": key,
+            "profile_uid": uid,
+            "card_text": card_text,
+            "card_html_head": "",
+            "history_text": history_text,
+            "match_rate": str(raw.get("matchRate") or "").strip(),
+            "has_send_button": bool(raw.get("hasSendButton")),
+        }
+
+    def _parse_profile_tab_members(
+        self, page: Page, step: PriorityStep
+    ) -> list[dict[str, Any]]:
+        """J1GirlUserPage?tab=N 型のプロフィール巡回一覧から会員を収集."""
+        tab_name = step.tab
+        wait_ms = 22000 if tab_name == "マッチ率" else 16000
+        self._wait_profile_tab_ready(page, step, timeout_ms=wait_ms)
+
+        members, history_texts = self.collect_members(page, tab_name, quiet=True)
+        if members and any(m.has_send_button for m in members):
+            sendable = sum(1 for m in members if m.has_send_button)
+            logger.info(
+                "【%s】プロフィール内リストDOM: %d 件（送信可 %d）",
+                tab_name,
+                len(members),
+                sendable,
+            )
+            return self._collected_to_raw_cards(members, history_texts)
+
+        uids = self._collect_profile_tab_uids(page, step)
+        for attempt in range(4):
+            if len(uids) > 1:
+                break
+            self._pause_ms(1200)
+            uids = self._collect_profile_tab_uids(page, step)
+        logger.info(
+            "【%s】プロフィール型一覧: uid %d 件を巡回", tab_name, len(uids)
+        )
+        if not uids:
+            one = self._parse_single_profile_member(page)
+            return [one] if one else []
+
+        parsed: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for uid in uids[:MAX_PROFILE_TAB_MEMBERS]:
+            current_uid = self._url_query_param(page, "uid")
+            if uid != current_uid:
+                if not self._goto_profile_tab(page, uid, step):
+                    continue
+                self._pause_ms(700)
+            card = self._parse_single_profile_member(page)
+            if not card:
+                continue
+            key = str(card.get("key") or "")
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            parsed.append(card)
+        return parsed
 
     def _step_markers(self, step: PriorityStep) -> dict[str, Any]:
         tab = step.tab
@@ -826,10 +1420,6 @@ class MiteneSender:
             )
         )
 
-    def _is_mygirl_list_page(self, page: Page) -> bool:
-        u = (page.url or "").lower()
-        return "comeonmygirllist" in u or "j10comeonmygirllist" in u
-
     def _ensure_comeon_context(self, page: Page) -> bool:
         """ミテネ会員一覧（横タブあり）の画面に入る."""
         if self._is_member_profile_page(page):
@@ -879,10 +1469,6 @@ class MiteneSender:
         if self._open_visitor_list_direct(page):
             return True
         return self._ensure_comeon_context(page)
-
-    def _ensure_visitor_list_entry(self, page: Page) -> bool:
-        """後方互換: _ensure_pickup_hub へ."""
-        return self._ensure_pickup_hub(page)
 
     def _find_tab_list_href(self, page: Page, list_path: str) -> str:
         """横タブ ul.tab 内の一覧リンク href."""
@@ -1014,66 +1600,6 @@ class MiteneSender:
             total += self._count_mitene_send_buttons_on_surface(surface)
         return total
 
-    def _collect_mitene_send_button_indices(self, page: Page) -> list[int]:
-        """画面上の CTA（a.kitene_send_btn__text_wrapper / registComeon）を上から順に."""
-        try:
-            indices = page.evaluate(
-                """() => {
-                    const kiteneSel =
-                        '.kitene_send_btn.active a.kitene_send_btn__text_wrapper, '
-                        + 'a.kitene_send_btn__text_wrapper[onclick*="registComeon"], '
-                        + 'a[onclick^="registComeon"]';
-                    let nodes = [...document.querySelectorAll(kiteneSel)];
-                    if (!nodes.length) {
-                        const re = /ミテネを送る|ミテネする/;
-                        nodes = [...document.querySelectorAll(
-                            'a, button, input, [role="button"], div, span'
-                        )].filter(el => {
-                            const raw = (el.innerText || el.value || '').replace(/\\s+/g, ' ').trim();
-                            return re.test(raw) && raw.length <= 50;
-                        });
-                    }
-                    const found = [];
-                    for (const el of nodes) {
-                        if (el.closest('.kitene_send_zumi_btn')) continue;
-                        const wrap = el.closest('.kitene_send_btn');
-                        if (wrap && !wrap.classList.contains('active')) continue;
-                        const r = el.getBoundingClientRect();
-                        if (r.width < 80 || r.height < 24 || r.top < 85) continue;
-                        if (!el.offsetParent) continue;
-                        const st = getComputedStyle(el);
-                        if (st.display === 'none' || st.visibility === 'hidden') continue;
-                        found.push({ el, top: r.top, area: r.width * r.height });
-                    }
-                    found.sort((a, b) => a.top - b.top || a.area - b.area);
-                    document.querySelectorAll('[data-mitene-auto-idx]').forEach(
-                        el => el.removeAttribute('data-mitene-auto-idx')
-                    );
-                    found.forEach((item, i) => item.el.setAttribute('data-mitene-auto-idx', String(i)));
-                    return found.map((_, i) => i);
-                }"""
-            )
-            return list(indices) if indices else []
-        except Exception:
-            return []
-
-    def _click_mitene_send_button_at_index(self, page: Page, index: int) -> bool:
-        try:
-            return bool(
-                page.evaluate(
-                    """(idx) => {
-                        const el = document.querySelector(`[data-mitene-auto-idx="${idx}"]`);
-                        if (!el) return false;
-                        el.scrollIntoView({ block: 'center', inline: 'nearest' });
-                        el.click();
-                        return true;
-                    }""",
-                    index,
-                )
-            )
-        except Exception:
-            return False
-
     def _open_visitor_list_direct(self, page: Page) -> bool:
         target = self._pickup_list_url(page)
         if not target:
@@ -1110,7 +1636,33 @@ class MiteneSender:
             except Exception:
                 pass
 
+        def _on_frame_navigated(frame) -> None:
+            try:
+                if frame != page.main_frame:
+                    return
+                url = frame.url or ""
+                prev = getattr(self, "_last_nav_action", "") or "(none)"
+                logger.warning("NAVIGATED -> %s (last_action=%s)", url, prev)
+                u = url.lower()
+                if "j1girluserpage" in u or "j10comeonkeeplist" in u:
+                    for line in traceback.format_stack(limit=12)[:-2]:
+                        logger.warning("  nav_stack: %s", line.rstrip())
+            except Exception:
+                pass
+
+        def _on_load(frame) -> None:
+            try:
+                if frame != page.main_frame:
+                    return
+                url = frame.url or ""
+                prev = getattr(self, "_last_nav_action", "") or "(none)"
+                logger.warning("PAGE_LOAD -> %s (last_action=%s)", url, prev)
+            except Exception:
+                pass
+
         page.on("dialog", _on_dialog)
+        page.on("framenavigated", _on_frame_navigated)
+        page.on("load", _on_load)
 
     def _safe_inner_text(self, page: Page) -> str:
         try:
@@ -1123,6 +1675,7 @@ class MiteneSender:
     def run(self) -> int:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._last_run_report = {}
+        self._locked_send_budget = None
         sent = 0
 
         with sync_playwright() as p:
@@ -1153,6 +1706,11 @@ class MiteneSender:
                     context.close()
                     break
                 except Exception as e:
+                    from job_runner import JobCancelled
+
+                    if isinstance(e, JobCancelled):
+                        context.close()
+                        raise
                     if self.screenshot_on_error and page:
                         self._save_error_screenshot(page)
                     context.close()
@@ -1176,6 +1734,14 @@ class MiteneSender:
         return sent
 
     def _launch(self, p: Playwright) -> Browser:
+        ws_endpoint = (os.getenv("PLAYWRIGHT_BROWSER_WS_ENDPOINT") or "").strip()
+        if not ws_endpoint:
+            token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
+            if token:
+                ws_endpoint = f"wss://chrome.browserless.io?token={token}"
+        if ws_endpoint:
+            logger.info("リモートブラウザに接続します")
+            return p.chromium.connect_over_cdp(ws_endpoint)
         return p.chromium.launch(
             headless=self.browser_cfg.headless,
             slow_mo=self.browser_cfg.slow_mo_ms,
@@ -1241,7 +1807,7 @@ class MiteneSender:
             "ログイン送信後 %d 秒待機（ページ安定まで）",
             LOGIN_POST_SUBMIT_WAIT_SEC,
         )
-        time.sleep(LOGIN_POST_SUBMIT_WAIT_SEC)
+        self._pause_ms(int(LOGIN_POST_SUBMIT_WAIT_SEC * 1000))
         self._wait_page_settled(page, quick=True)
         self.human.after_login_pause()
 
@@ -1270,6 +1836,7 @@ class MiteneSender:
         last_error = ""
 
         for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
+            self._check_job_control()
             logger.info("ログイン試行 %d/%d", attempt, LOGIN_MAX_ATTEMPTS)
 
             if not self._open_login_page(page):
@@ -1311,7 +1878,7 @@ class MiteneSender:
                         "IPブロック防止のため %d 秒待機してから再ログインします",
                         wait_sec,
                     )
-                    page.wait_for_timeout(LOGIN_RETRY_WAIT_MS)
+                    self._pause_ms(LOGIN_RETRY_WAIT_MS)
 
         raise RuntimeError(
             f"ログインに失敗しました（{LOGIN_MAX_ATTEMPTS}回試行）。{last_error}"
@@ -1391,15 +1958,6 @@ class MiteneSender:
             snippet = "(本文取得不可)"
         return f"URL={page.url} … {snippet}"
 
-    def _ensure_pickup_ready(self, page: Page, timeout_ms: int = 15000) -> bool:
-        page.evaluate("window.scrollTo(0, 0)")
-        deadline = time.monotonic() + timeout_ms / 1000
-        while time.monotonic() < deadline:
-            if self._pickup_tab_bar_visible(page):
-                return True
-            page.wait_for_timeout(500)
-        return False
-
     def _ensure_deco_home(self, page: Page) -> None:
         """姫デコホーム（ミテネCTA・残り回数）が表示されるまで待ち、スクロール."""
         label = self.standard.remaining_label
@@ -1421,20 +1979,29 @@ class MiteneSender:
             if self._parse_remaining_count(page) is not None:
                 return
             page.evaluate("window.scrollBy(0, Math.min(window.innerHeight, 420))")
-            page.wait_for_timeout(400)
+            self._pause_ms(400)
 
-    def _extract_remaining_from_text(self, text: str) -> int | None:
-        normalized = _normalize_digits(text)
-        match = REMAINING_PATTERN.search(normalized)
-        if not match:
+    def _mitene_remaining_values_in_text(self, text: str) -> list[int]:
+        normalized = _normalize_digits(text or "")
+        return [int(v) for v in MITENE_REMAINING_PATTERN.findall(normalized)]
+
+    def _extract_remaining_from_text(
+        self, text: str, *, allow_slash: bool = False
+    ) -> int | None:
+        """テキスト断片から残り回数を取得（複数マッチ時は最大値＝誤った0を避ける）."""
+        values = self._mitene_remaining_values_in_text(text)
+        if values:
+            return max(values)
+        if not allow_slash:
             return None
-        for g in match.groups():
-            if g is not None:
-                return int(g)
+        normalized = _normalize_digits(text or "")
+        match = REMAINING_SLASH_PATTERN.search(normalized)
+        if match:
+            return int(match.group(1))
         return None
 
     def _parse_remaining_count(self, page: Page) -> int | None:
-        """CTA付近またはページ内の「ミテネ残り回数：N回」を取得."""
+        """CTA付近・ラベル・本文から「ミテネ残り回数：N回」を取得."""
         try:
             return self._parse_remaining_count_inner(page)
         except Exception as e:
@@ -1442,43 +2009,82 @@ class MiteneSender:
                 return None
             raise
 
-    def _parse_remaining_count_inner(self, page: Page) -> int | None:
-        near = self._parse_remaining_near_cta(page)
-        if near is not None:
-            return near
-
+    def _parse_remaining_from_labels(self, page: Page) -> list[int]:
+        values: list[int] = []
         try:
             loc = page.get_by_text(self.standard.remaining_label, exact=False)
             n = self._safe_count(loc)
-            if n > 0:
-                for i in range(min(n, 5)):
-                    text = loc.nth(i).evaluate(
-                        """el => {
-                            let node = el;
-                            for (let i = 0; i < 4 && node; i++, node = node.parentElement) {
-                                const t = (node.innerText || '').trim();
-                                if (t.includes('ミテネ残り回数')) return t;
-                            }
-                            return (el.innerText || '').trim();
-                        }"""
-                    )
-                    parsed = self._extract_remaining_from_text(text)
-                    if parsed is not None:
-                        return parsed
+            for i in range(min(n, 5)):
+                text = loc.nth(i).evaluate(
+                    """el => {
+                        let node = el;
+                        for (let i = 0; i < 4 && node; i++, node = node.parentElement) {
+                            const t = (node.innerText || '').trim();
+                            if (t.includes('ミテネ残り回数')) return t;
+                        }
+                        return (el.innerText || '').trim();
+                    }"""
+                )
+                parsed = self._extract_remaining_from_text(text)
+                if parsed is not None:
+                    values.append(parsed)
         except Exception:
             pass
+        return values
 
+    def _parse_remaining_from_body(self, page: Page) -> int | None:
+        """本文全体から取得（正の値のみ・0は誤検出になりやすいので採用しない）."""
         for source in (
             lambda: page.inner_text("body"),
             lambda: page.content(),
         ):
             try:
-                parsed = self._extract_remaining_from_text(source())
-                if parsed is not None:
-                    return parsed
+                values = self._mitene_remaining_values_in_text(source())
+                positives = [v for v in values if v > 0]
+                if positives:
+                    return max(positives)
             except Exception:
                 continue
         return None
+
+    def _collect_remaining_reads(self, page: Page) -> list[tuple[str, int]]:
+        reads: list[tuple[str, int]] = []
+
+        near = self._parse_remaining_near_cta(page)
+        if near is not None:
+            reads.append(("cta", near))
+
+        label_vals = self._parse_remaining_from_labels(page)
+        if label_vals:
+            reads.append(("label", max(label_vals)))
+
+        if not reads:
+            body_val = self._parse_remaining_from_body(page)
+            if body_val is not None:
+                reads.append(("body", body_val))
+
+        return reads
+
+    def _merge_remaining_reads(self, reads: list[tuple[str, int]]) -> int | None:
+        if not reads:
+            return None
+        values = [v for _, v in reads]
+        if any(v > 0 for v in values):
+            chosen = max(v for v in values if v > 0)
+            if len(set(values)) > 1:
+                logger.info(
+                    "残り回数の読み取り差異 %s → %d 回を採用",
+                    reads,
+                    chosen,
+                )
+            return chosen
+        sources = {source for source, _ in reads}
+        if sources & {"cta", "label"}:
+            return 0
+        return None
+
+    def _parse_remaining_count_inner(self, page: Page) -> int | None:
+        return self._merge_remaining_reads(self._collect_remaining_reads(page))
 
     def _parse_remaining_near_cta(self, page: Page) -> int | None:
         cta = page.get_by_text(self.standard.find_members_button, exact=False)
@@ -1498,34 +2104,201 @@ class MiteneSender:
             )
         except Exception:
             return None
-        return self._extract_remaining_from_text(block_text)
+        return self._extract_remaining_from_text(block_text, allow_slash=True)
+
+    def _cap_send_budget(self, remaining: int) -> int:
+        if self.standard.max_send_per_run > 0:
+            return min(remaining, self.standard.max_send_per_run)
+        return remaining
+
+    def _retry_remaining_on_suspect_zero(self, page: Page) -> int | None:
+        """0 判定のときだけホームを安定させて再読み取り（表示遅延・誤検出対策）."""
+        on_home = self._safe_count_text(page, self.standard.find_members_button) > 0
+        if not on_home:
+            return None
+        for attempt in range(1, 5):
+            wait_ms = 600 + attempt * 350
+            logger.info(
+                "残り回数0のため再確認 (%d/4) … %d ms 待機",
+                attempt,
+                wait_ms,
+            )
+            self._pause_ms(wait_ms)
+            page.evaluate("window.scrollTo(0, 0)")
+            self._pause_ms(250)
+            self._wait_page_settled(page, quick=True)
+            for _ in range(2):
+                parsed = self._parse_remaining_count_inner(page)
+                if parsed is not None and parsed > 0:
+                    return parsed
+                page.evaluate(
+                    "window.scrollBy(0, Math.min(window.innerHeight, 420))"
+                )
+                self._pause_ms(350)
+        return self._parse_remaining_count_inner(page)
+
+    def _budget_read_error(self, reason: str) -> RuntimeError:
+        return RuntimeError(f"{BUDGET_READ_FAILED_PREFIX}（{reason}）")
+
+    def _collect_remaining_dom_snippet(self, page: Page) -> str:
+        chunks: list[str] = []
+        try:
+            cta = page.get_by_text(self.standard.find_members_button, exact=False)
+            if self._safe_count(cta) > 0:
+                text = cta.first.evaluate(
+                    """el => {
+                        const p = el.closest('p, div, section, li') || el.parentElement;
+                        return (p ? p.innerText : el.innerText) || '';
+                    }"""
+                )
+                chunks.append(f"CTA付近: {(text or '')[:800]}")
+            else:
+                chunks.append("CTA付近: （ボタン未検出）")
+        except Exception as exc:
+            chunks.append(f"CTA付近: （取得失敗: {exc}）")
+        try:
+            loc = page.get_by_text(self.standard.remaining_label, exact=False)
+            if self._safe_count(loc) > 0:
+                chunks.append(f"ラベル: {loc.first.inner_text()[:400]}")
+            else:
+                chunks.append("ラベル: （未検出）")
+        except Exception as exc:
+            chunks.append(f"ラベル: （取得失敗: {exc}）")
+        try:
+            chunks.append(f"body先頭: {page.inner_text('body')[:1500]}")
+        except Exception as exc:
+            chunks.append(f"body先頭: （取得失敗: {exc}）")
+        return "\n".join(chunks)
+
+    def _log_budget_read(
+        self,
+        page: Page,
+        *,
+        dom_snippet: str,
+        regex_values: list[int],
+        reads: list[tuple[str, int]],
+        final_budget: int | None,
+    ) -> None:
+        logger.info("【残り回数取得】URL: %s", page.url or "")
+        logger.info("【残り回数取得】読み取ったDOM: %s", dom_snippet)
+        logger.info(
+            "【残り回数取得】正規表現で取得した数値: %s",
+            regex_values if regex_values else "（なし）",
+        )
+        logger.info(
+            "【残り回数取得】読み取りソース: %s",
+            reads if reads else "（なし）",
+        )
+        logger.info(
+            "【残り回数取得】最終budget: %s",
+            final_budget if final_budget is not None else "（取得失敗）",
+        )
+
+    def _has_confident_zero_read(self, reads: list[tuple[str, int]]) -> bool:
+        zero_sources = {source for source, value in reads if value == 0}
+        return bool(zero_sources & {"cta", "label", "retry", "list"})
 
     def _read_send_budget(self, page: Page) -> int:
+        """ミテネ残り回数を取得。budget==0 のみ DailyLimitReached、取得失敗は RuntimeError."""
+        if self._locked_send_budget is not None:
+            logger.info(
+                "【残り回数取得】ロック済みbudgetを使用: %d",
+                self._locked_send_budget,
+            )
+            return self._locked_send_budget
+
         if not self._is_on_pickup_member_page(page):
             self._ensure_deco_home(page)
-        remaining = self._parse_remaining_count(page)
+
+        dom_snippet = self._collect_remaining_dom_snippet(page)
+        reads = self._collect_remaining_reads(page)
+        regex_values = self._mitene_remaining_values_in_text(dom_snippet)
+        remaining = self._merge_remaining_reads(reads)
+
         if remaining is None:
+            self._log_budget_read(
+                page,
+                dom_snippet=dom_snippet,
+                regex_values=regex_values,
+                reads=reads,
+                final_budget=None,
+            )
             on_home = (
                 self._safe_count_text(page, self.standard.find_members_button) > 0
             )
             if not on_home:
-                raise RuntimeError(
+                logger.warning(
                     "姫デコのホーム画面を開けませんでした。"
                     "「女の子ログイン」のURLが古い・期限切れ、またはログインに失敗している可能性があります。"
-                    "スマホのSafariで開いているログインページのURLを、PHPSESSID 付きの古いURLではなく"
-                    "今開いているURLのまま登録し直してから再実行してください。"
                 )
-            raise RuntimeError(
-                f"「{self.standard.remaining_label}」が見つかりません。"
-                "ホーム画面で CTA の下に表示されているか確認してください。"
-                "（画面上は20回あっても、自動操作が別ページを見ている場合があります）"
+                raise self._budget_read_error("ホーム画面を開けませんでした")
+            raise self._budget_read_error("CTA付近の残り回数が読み取れませんでした")
+
+        if remaining < 0:
+            self._log_budget_read(
+                page,
+                dom_snippet=dom_snippet,
+                regex_values=regex_values,
+                reads=reads,
+                final_budget=None,
             )
-        logger.info("送信予定回数（ミテネ残り回数）: %d", remaining)
-        if remaining <= 0:
-            raise DailyLimitReached("ミテネ残り回数が 0 です。")
-        if self.standard.max_send_per_run > 0:
-            remaining = min(remaining, self.standard.max_send_per_run)
-        return remaining
+            raise self._budget_read_error(f"不正な残り回数: {remaining}")
+
+        if remaining == 0:
+            retried = self._retry_remaining_on_suspect_zero(page)
+            if retried is not None and retried > 0:
+                logger.info("残り回数の再確認で %d 回を取得", retried)
+                remaining = retried
+                reads.append(("retry", retried))
+            else:
+                try:
+                    if self._safe_count_text(
+                        page, self.standard.find_members_button
+                    ) > 0:
+                        logger.info("残り0のため会員探し画面でも再確認します")
+                        self._open_find_members(page)
+                        list_rem = self._parse_remaining_count(page)
+                        if list_rem is not None and list_rem > 0:
+                            logger.info("会員探し画面で残り %d 回を取得", list_rem)
+                            remaining = list_rem
+                            reads.append(("list", list_rem))
+                        elif list_rem == 0:
+                            reads.append(("list", 0))
+                except Exception as e:
+                    logger.debug("会員探しでの残り回数再確認失敗: %s", e)
+
+            if remaining == 0:
+                if self._has_confident_zero_read(reads):
+                    self._log_budget_read(
+                        page,
+                        dom_snippet=dom_snippet,
+                        regex_values=regex_values,
+                        reads=reads,
+                        final_budget=0,
+                    )
+                    raise DailyLimitReached("ミテネ残り回数が 0 です。")
+                self._log_budget_read(
+                    page,
+                    dom_snippet=dom_snippet,
+                    regex_values=regex_values,
+                    reads=reads,
+                    final_budget=None,
+                )
+                raise self._budget_read_error(
+                    "残り0と判定されましたがCTA付近で確認できませんでした"
+                )
+
+        budget = self._cap_send_budget(remaining)
+        self._log_budget_read(
+            page,
+            dom_snippet=dom_snippet,
+            regex_values=regex_values,
+            reads=reads,
+            final_budget=budget,
+        )
+        self._locked_send_budget = budget
+        logger.info("送信予定回数（ミテネ残り回数）: %d", budget)
+        return budget
 
     def _load_member_send_history(self) -> None:
         """会員ごとの最終送信日を読み込む."""
@@ -1653,42 +2426,34 @@ class MiteneSender:
     def _mark_member_sent(self, key: str) -> None:
         was_new = key not in self._member_last_sent
         self._sent_member_keys.add(key)
+        if self._member_extraction_debug_enabled() and key.startswith("comeon-"):
+            mid = key[7:]
+            if mid not in self._debug_run_sent_success:
+                self._debug_run_sent_success.append(mid)
         self._invalidate_list_cache()
         if not self.dry_run:
             self._record_member_sent(key)
             if was_new:
                 self._no_history_sent_today += 1
 
-    def _goto_girl_domain_if_needed(self, page: Page) -> None:
-        """横タブが spgirl で出ないときだけ girl ドメインを試す（失敗時は spgirl に戻す）."""
-        if self._pickup_tab_bar_visible(page):
-            return
-        url = page.url
-        if "spgirl." not in url or self._is_browser_error_page(page):
-            return
-        alt = url.replace("spgirl.", "girl.", 1)
-        logger.info("横タブ未検出のため girl ドメインを試します: %s", alt)
-        if self._safe_goto(page, alt) and self._pickup_tab_bar_visible(page):
-            return
-        sp_back = alt.replace("girl.", "spgirl.", 1)
-        if sp_back != page.url:
-            logger.info("girl で表示できないため spgirl に戻します")
-            self._safe_goto(page, sp_back)
-
     def _wait_for_send_buttons(self, page: Page, timeout_ms: int = 20000) -> bool:
         """「ミテネを送る」ボタンが出るまで待つ."""
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
+            self._check_job_control()
             if self._page_has_send_targets(page):
                 return True
-            page.wait_for_timeout(400)
+            self._pause_ms(400)
         return False
 
     def _ensure_member_list_page(self, page: Page) -> None:
         """送信後、③会員一覧（ミテネを送るが並ぶ画面）に戻す."""
+        step = self._current_step
         if self._is_member_profile_page(page):
+            if step and self._is_step_profile_page(page, step):
+                self._wait_page_settled(page, quick=True)
+                return
             logger.info("送信後: プロフィールから一覧へ戻る")
-            step = self._current_step
             if step:
                 self._navigate_to_url_safe(page, step, force_reload=True)
             else:
@@ -1794,12 +2559,13 @@ class MiteneSender:
 
     def _stop_browser_pending_tasks(self, page: Page) -> None:
         """遷移前に未完了の読込・クリック要求を破棄（window.stop）."""
+        self._check_job_control()
         logger.info("移動前にブラウザの未完了処理を強制停止します")
         try:
             page.evaluate("window.stop();")
         except Exception:
             pass
-        page.wait_for_timeout(PRE_NAV_STOP_MS)
+        self._pause_ms(PRE_NAV_STOP_MS)
 
     def _goto_list_target(self, page: Page, url: str) -> bool:
         """一覧URLへ goto（chrome-error 時は False）."""
@@ -1860,6 +2626,7 @@ class MiteneSender:
         attempt = 0
 
         while time.monotonic() < deadline:
+            self._check_job_control()
             attempt += 1
             logger.info(
                 "一覧URLへ直接遷移を試みます (試行 %d) -> %s",
@@ -1868,14 +2635,14 @@ class MiteneSender:
             )
             self._stop_browser_pending_tasks(page)
             if not self._goto_list_target(page, target):
-                page.wait_for_timeout(400)
+                self._pause_ms(400)
                 continue
 
-            page.wait_for_timeout(LIST_GOTO_SETTLE_MS)
+            self._pause_ms(LIST_GOTO_SETTLE_MS)
 
             if self._is_member_profile_page(page):
                 logger.warning(
-                    "【%s】プロフィールページへの引き戻しを検知。再度リトライします: %s",
+                    "【%s】プロフィールへリダイレクトされたため再試行: %s",
                     tab_name,
                     page.url,
                 )
@@ -1887,7 +2654,7 @@ class MiteneSender:
                     tab_name,
                     page.url,
                 )
-                page.wait_for_timeout(LIST_URL_FIXED_EXTRA_MS)
+                self._pause_ms(LIST_URL_FIXED_EXTRA_MS)
                 logger.info("【%s】ページの固定を確認。解析を開始します", tab_name)
                 return True
 
@@ -1905,7 +2672,7 @@ class MiteneSender:
         )
         self._stop_browser_pending_tasks(page)
         self._goto_list_target(page, target)
-        page.wait_for_timeout(FINAL_FORCED_WAIT_MS)
+        self._pause_ms(FINAL_FORCED_WAIT_MS)
 
         if self._is_on_target_list_url(page, target, list_path):
             logger.info("【%s】最終再打診で一覧固定成功: %s", tab_name, page.url)
@@ -1953,21 +2720,47 @@ class MiteneSender:
             try:
                 page.wait_for_selector(sel, state="visible", timeout=8000)
                 logger.info("【%s】一覧DOM検出: %s", step.tab, sel)
+                logger.info(
+                    "【%s】一覧DOM検出直後 URL=%s", step.tab, page.url or ""
+                )
                 break
             except Exception:
                 continue
 
+        self._set_nav_debug_action(
+            f"_navigate_to_url_safe:{step.tab}:post_dom_detect:profile_check"
+        )
         if self._is_member_profile_page(page):
+            logger.warning(
+                "【%s】一覧直打ち後もプロフィールURL: %s",
+                step.tab,
+                page.url,
+            )
             return False
 
+        self._set_nav_debug_action(
+            f"_navigate_to_url_safe:{step.tab}:pre_dismiss_optional_popups"
+        )
         self._dismiss_optional_popups(page)
+        logger.info(
+            "【%s】dismiss_optional_popups直後 URL=%s", step.tab, page.url or ""
+        )
 
+        self._set_nav_debug_action(
+            f"_navigate_to_url_safe:{step.tab}:post_dismiss:is_on_step_list_page"
+        )
         if path and self._is_on_step_list_page(page, path):
             logger.info("【%s】URL直打ち成功: %s", step.tab, page.url)
             return True
+        self._set_nav_debug_action(
+            f"_navigate_to_url_safe:{step.tab}:post_dismiss:verify_step_list"
+        )
         if self._verify_step_list(page, step):
             logger.info("【%s】URL直打ち成功: %s", step.tab, page.url)
             return True
+        self._set_nav_debug_action(
+            f"_navigate_to_url_safe:{step.tab}:post_dismiss:is_on_target_list_url"
+        )
         if self._is_on_target_list_url(page, target, path):
             logger.info("【%s】一覧URL固定確認: %s", step.tab, page.url)
             return True
@@ -2055,9 +2848,16 @@ class MiteneSender:
             "【マイガール】タブクリック後 %dms 待機",
             MYGIRL_TAB_CLICK_WAIT_MS,
         )
-        page.wait_for_timeout(MYGIRL_TAB_CLICK_WAIT_MS)
+        self._pause_ms(MYGIRL_TAB_CLICK_WAIT_MS)
 
         if self._is_member_profile_page(page):
+            mygirl_step = PriorityStep(tab="マイガール", list_path=MYGIRL_LIST_PATH)
+            if self._is_step_profile_page(page, mygirl_step):
+                self._current_list_path = MYGIRL_LIST_PATH
+                logger.info(
+                    "【マイガール】プロフィール型一覧表示: %s", page.url
+                )
+                return True
             logger.warning(
                 "【マイガール】タブクリック後もプロフィール: %s",
                 page.url,
@@ -2083,8 +2883,9 @@ class MiteneSender:
 
     def _fetch_tab_members(
         self, page: Page, step: PriorityStep
-    ) -> list[dict[str, Any]]:
-        """window.stop → URL固定 → スクロール → 会員カード解析."""
+    ) -> tuple[list[Member], dict[str, str]]:
+        """window.stop → URL固定 → スクロール → collect_members."""
+        self._check_job_control()
         self._invalidate_list_cache()
         self._send_button_queue.clear()
         self._current_step = step
@@ -2095,94 +2896,425 @@ class MiteneSender:
             opened = self._open_mygirl_via_keep_tab(page)
         else:
             opened = self._navigate_to_url_safe(page, step, force_reload=True)
+            if not opened:
+                logger.info("【%s】直打ち失敗 → 横タブ切替を試行", step.tab)
+                opened = self._navigate_to_step_list(page, step)
         if not opened:
             logger.warning("【%s】一覧取得失敗（gid=%s）", step.tab, self._gid())
-            return []
+            return [], {}
 
-        if self._is_member_profile_page(page):
-            logger.warning("【%s】プロフィールのため解析スキップ: %s", step.tab, page.url)
-            return []
+        if self._member_extraction_debug_enabled():
+            self._log_tab_switch_debug(page, step.tab)
 
-        self._scroll_member_list_to_end(page)
-        cards = self._parse_list_page_cards(page, step.tab)
-        sendable = sum(
-            1 for c in cards if isinstance(c, dict) and c.get("has_send_button")
-        )
-        new_n = sum(
-            1
-            for c in cards
-            if isinstance(c, dict)
-            and c.get("has_send_button")
-            and not c.get("sent_history")
-        )
-        logger.info(
-            "【%s】会員パース完了: 全 %d 件 / 送信ボタン %d / 新規 %d 件",
-            step.tab,
-            len(cards),
-            sendable,
-            new_n,
-        )
-        return [c for c in cards if isinstance(c, dict)]
+        if not self._ensure_on_step_list_for_parse(page, step):
+            logger.warning(
+                "【%s】一覧ページを確認できないため解析を中止", step.tab
+            )
+            return [], {}
 
-    def _filter_new_sendable_cards(
+        pre_count = self._prepare_list_page_before_collect(page, step.tab)
+        self._log_list_page_before_parse(
+            page, step.tab, pre_count, step=step
+        )
+        if self._is_member_profile_page(page) or not self._verify_step_list(
+            page, step
+        ):
+            logger.warning(
+                "【%s】一覧でないため解析を中止: %s", step.tab, page.url
+            )
+            return [], {}
+
+        return self.collect_members(
+            page, step.tab, list_prepared=True, pre_card_count=pre_count
+        )
+
+    def _raw_cards_to_collected(
         self, cards: list[dict[str, Any]]
+    ) -> tuple[list[Member], dict[str, str]]:
+        """プロフィール型一覧の生カード → Member + history_texts."""
+        members: list[Member] = []
+        history_texts: dict[str, str] = {}
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            mid = str(card.get("mid") or card.get("uid") or "").strip()
+            if not mid:
+                continue
+            history_texts[mid] = str(card.get("history_text") or "").strip()
+            members.append(
+                Member(
+                    member_id=mid,
+                    name=str(card.get("name") or "（名前不明）"),
+                    has_send_button=bool(card.get("has_send_button")),
+                )
+            )
+        return members, history_texts
+
+    def _collected_to_raw_cards(
+        self,
+        members: list[Member],
+        history_texts: dict[str, str],
     ) -> list[dict[str, Any]]:
+        """Member + history_texts → プロフィール巡回用の生カード dict."""
+        cards: list[dict[str, Any]] = []
+        for member in members:
+            mid = member.member_id
+            if not mid:
+                continue
+            cards.append(
+                {
+                    "name": member.name,
+                    "uid": mid,
+                    "mid": mid,
+                    "key": member_queue_key(mid),
+                    "history_text": history_texts.get(mid, ""),
+                    "has_send_button": member.has_send_button,
+                }
+            )
+        return cards
+
+    def _filter_new_members(
+        self,
+        members: list[Member],
+        history_texts: dict[str, str],
+        step: PriorityStep,
+    ) -> list[Member]:
         """新規会員（ミテネ履歴に「送信済」なし）かつ送信ボタンあり."""
-        out: list[dict[str, Any]] = []
-        for card in cards:
-            key = str(card.get("key") or "")
-            if not key or not card.get("has_send_button"):
-                continue
-            if card.get("sent_history"):
-                continue
-            if key in self._sent_member_keys or key in self._failed_member_keys:
-                continue
-            out.append(card)
-        return out
+        return self._apply_step_member_filter(members, history_texts, step)
 
-    def _filter_sendable_cards(
-        self, cards: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    def _filter_sendable_members(
+        self,
+        members: list[Member],
+        history_texts: dict[str, str],
+        step: PriorityStep,
+    ) -> list[Member]:
         """送信ボタンがあり未送信キューに入れられる会員."""
-        out: list[dict[str, Any]] = []
-        for card in cards:
-            key = str(card.get("key") or "")
-            if not key or not card.get("has_send_button"):
-                continue
+        return self._apply_step_member_filter(members, history_texts, step)
+
+    def _members_to_keys(self, members: list[Member]) -> list[str]:
+        keys: list[str] = []
+        for member in members:
+            key = member_queue_key(member.member_id)
             if key in self._sent_member_keys or key in self._failed_member_keys:
                 continue
-            out.append(card)
-        return out
+            if not member.has_send_button:
+                continue
+            keys.append(key)
+        return keys
 
-    def _sort_all_members_oldest_first_keys(
-        self, members: list[dict[str, Any]]
-    ) -> list[str]:
-        """全会員を送信日古い順（同日ランダム）でキー列にする."""
+    def _sort_members_oldest_first(self, members: list[Member]) -> list[Member]:
+        """全会員を送信日古い順（同日ランダム）に並べる."""
         pool = [
             m
             for m in members
-            if isinstance(m, dict)
-            and m.get("key")
-            and m.get("has_send_button")
-            and m["key"] not in self._sent_member_keys
-            and m["key"] not in self._failed_member_keys
+            if m.member_id
+            and m.has_send_button
+            and member_queue_key(m.member_id) not in self._sent_member_keys
+            and member_queue_key(m.member_id) not in self._failed_member_keys
         ]
         if not pool:
             return []
         random.shuffle(pool)
-        pool.sort(
-            key=lambda m: m.get("history_date") or OLDEST_SORT_DEFAULT_DATE  # type: ignore[arg-type]
-        )
-        ordered: list[dict[str, Any]] = []
+        pool.sort(key=lambda m: m.last_sent or OLDEST_SORT_DEFAULT_DATE)
+        ordered: list[Member] = []
         for _, grp in itertools.groupby(
             pool,
-            key=lambda m: m.get("history_date") or OLDEST_SORT_DEFAULT_DATE,  # type: ignore[arg-type]
+            key=lambda m: m.last_sent or OLDEST_SORT_DEFAULT_DATE,
         ):
             batch = list(grp)
             if len(batch) > 1:
                 random.shuffle(batch)
             ordered.extend(batch)
-        return [str(m["key"]) for m in ordered]
+        return ordered
+
+    def _reset_debug_run_tracking(self) -> None:
+        self._debug_run_sent_success.clear()
+        self._debug_run_sent_failed.clear()
+        self._debug_run_excluded.clear()
+        self._debug_exclusion_logged.clear()
+        self._send_run_phases.clear()
+        self._send_phase_tracker = None
+        self._last_send_attempt = None
+
+    def _member_id_from_queue_key(self, key: str) -> str:
+        return key[7:] if key.startswith("comeon-") else (key or "").strip()
+
+    def _set_send_attempt_outcome(
+        self, member_id: str, status: str, reason: str = ""
+    ) -> None:
+        self._last_send_attempt = {
+            "member_id": member_id,
+            "status": status,
+            "reason": reason,
+        }
+
+    def _begin_send_phase_tracking(self, label: str, keys: list[str]) -> None:
+        queued = [
+            self._member_id_from_queue_key(k)
+            for k in keys
+            if k.startswith("comeon-")
+        ]
+        self._send_phase_tracker = SendPhaseRecord(label=label, queued_ids=queued)
+        self._send_run_phases.append(self._send_phase_tracker)
+        logger.info("=====送信フェーズ===== %s", label)
+
+    def _record_send_attempt_from_last(self) -> None:
+        outcome = self._last_send_attempt
+        tracker = self._send_phase_tracker
+        if not outcome or not tracker:
+            return
+        member_id = outcome.get("member_id") or ""
+        if not member_id:
+            return
+        status = outcome.get("status") or "失敗"
+        reason = outcome.get("reason") or ""
+        tracker.index += 1
+        tracker.attempted.append(member_id)
+        total = len(tracker.queued_ids) or tracker.index
+        logger.info("%d/%d", tracker.index, total)
+        logger.info("member_id=%s", member_id)
+        if status == "成功":
+            tracker.success.append(member_id)
+            logger.info("成功")
+        elif status == "スキップ":
+            tracker.skipped[member_id] = reason
+            logger.info("スキップ")
+            if reason:
+                logger.info("理由: %s", reason)
+        else:
+            tracker.failed[member_id] = reason or "送信失敗"
+            logger.info("失敗")
+            if reason:
+                logger.info("理由: %s", reason)
+        logger.info("")
+
+    def _log_send_reconciliation_block(
+        self,
+        *,
+        title: str,
+        queued_ids: list[str],
+        success_ids: list[str],
+        failed_ids: dict[str, str],
+        not_executed_ids: list[str],
+    ) -> None:
+        logger.info("=====%s=====", title)
+        logger.info("送信キュー")
+        for mid in queued_ids:
+            logger.info(mid)
+        logger.info("")
+        logger.info("成功")
+        for mid in success_ids:
+            logger.info(mid)
+        logger.info("")
+        logger.info("失敗")
+        for mid in queued_ids:
+            if mid in failed_ids:
+                logger.info(mid)
+        for mid, _reason in failed_ids.items():
+            if mid not in queued_ids:
+                logger.info(mid)
+        logger.info("")
+        logger.info("未実行")
+        for mid in not_executed_ids:
+            logger.info(mid)
+
+    def _finish_send_phase_tracking(self) -> None:
+        tracker = self._send_phase_tracker
+        if not tracker:
+            return
+        attempted_set = set(tracker.attempted)
+        not_executed = [
+            mid for mid in tracker.queued_ids if mid not in attempted_set
+        ]
+        failed_all = dict(tracker.failed)
+        failed_all.update(tracker.skipped)
+        self._log_send_reconciliation_block(
+            title=f"照合 {tracker.label}",
+            queued_ids=tracker.queued_ids,
+            success_ids=tracker.success,
+            failed_ids=failed_all,
+            not_executed_ids=not_executed,
+        )
+        self._send_phase_tracker = None
+
+    def _log_run_send_reconciliation(self) -> None:
+        if not self._send_run_phases:
+            return
+        queued: list[str] = []
+        seen_queued: set[str] = set()
+        for phase in self._send_run_phases:
+            for mid in phase.queued_ids:
+                if mid in seen_queued:
+                    continue
+                seen_queued.add(mid)
+                queued.append(mid)
+        success: list[str] = []
+        seen_success: set[str] = set()
+        failed: dict[str, str] = {}
+        attempted: set[str] = set()
+        for phase in self._send_run_phases:
+            attempted.update(phase.attempted)
+            for mid in phase.success:
+                if mid not in seen_success:
+                    seen_success.add(mid)
+                    success.append(mid)
+            failed.update(phase.failed)
+            failed.update(phase.skipped)
+        not_executed = [mid for mid in queued if mid not in attempted]
+        self._log_send_reconciliation_block(
+            title="照合",
+            queued_ids=queued,
+            success_ids=success,
+            failed_ids=failed,
+            not_executed_ids=not_executed,
+        )
+        logger.info(
+            "送信キュー %d 件 → 成功 %d / 失敗 %d / 未実行 %d",
+            len(queued),
+            len(success),
+            len(failed),
+            len(not_executed),
+        )
+
+    def _register_failed_member_key(self, key: str) -> None:
+        self._failed_member_keys.add(key)
+        if self._member_extraction_debug_enabled() and key.startswith("comeon-"):
+            mid = key[7:]
+            if mid not in self._debug_run_sent_failed:
+                self._debug_run_sent_failed.append(mid)
+
+    def _log_exclusion_immediate(self, member: Member, reason: str) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        mid = (member.member_id or "").strip()
+        if not mid or mid in self._debug_exclusion_logged:
+            return
+        self._debug_exclusion_logged.add(mid)
+        logger.info("【除外】member_id=%s", mid)
+        logger.info("%s", member.name)
+        logger.info("理由：%s", reason)
+        if mid not in self._debug_run_excluded:
+            self._debug_run_excluded.append(mid)
+
+    def _log_filter_exclusions_immediate(
+        self,
+        enriched: list[Member],
+        filtered: list[Member],
+        duplicates: list[Member],
+        step: PriorityStep,
+    ) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        mode = step.member_filter or "sendable"
+        filtered_ids = {m.member_id for m in filtered}
+        for member in duplicates:
+            self._log_exclusion_immediate(member, "重複")
+        for member in enriched:
+            if member.member_id in filtered_ids:
+                continue
+            self._log_exclusion_immediate(
+                member, self._member_filter_exclusion_reason(member, mode)
+            )
+
+    def _log_locator_correlation_failure(
+        self,
+        tab_name: str,
+        *,
+        member_id: str,
+        name: str,
+        inner_text: str,
+        outer_html: str,
+    ) -> None:
+        """DOMカードから member_id を Locator に対応づけできなかった場合（必ず出力）."""
+        logger.info("【%s】Locator対応失敗", tab_name)
+        logger.info("member_id: %s", member_id or "(未取得)")
+        logger.info("名前: %s", name)
+        logger.info("card outerHTML先頭500: %s", (outer_html or "")[:500])
+        logger.info("card innerText: %s", inner_text)
+
+    def _log_tab_correlation_stats_debug(
+        self, page: Page, tab_name: str, members: list[Member]
+    ) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        surface = self._member_card_surface(page)
+        card_count = self._count_member_cards_on_surface(surface)
+        locator_count = self._count_mitene_send_buttons(page)
+        id_success = len(members)
+        id_fail = self._debug_parse_id_fail_count
+        logger.info("【%s】カード数: %d", tab_name, card_count)
+        logger.info("【%s】送信ボタンLocator数: %d", tab_name, locator_count)
+        logger.info("【%s】member_id対応成功数: %d", tab_name, id_success)
+        logger.info("【%s】対応失敗数: %d", tab_name, id_fail)
+
+    def _log_tab_switch_debug(self, page: Page, tab_name: str) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        try:
+            title = page.title()
+        except Exception:
+            title = ""
+        card_count = self._count_member_cards_on_surface(
+            self._member_card_surface(page)
+        )
+        logger.info("【%s】タブ切替後", tab_name)
+        logger.info("URL: %s", page.url or "")
+        logger.info("ページタイトル: %s", title)
+        logger.info("カード数: %d", card_count)
+
+    def _log_scroll_metrics_debug(self, page: Page) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        try:
+            metrics = page.evaluate(
+                """() => ({
+                    scrollTop: document.documentElement.scrollTop
+                        || document.body.scrollTop || 0,
+                    scrollHeight: Math.max(
+                        document.body.scrollHeight,
+                        document.documentElement.scrollHeight
+                    ),
+                    clientHeight: document.documentElement.clientHeight
+                        || window.innerHeight || 0
+                })"""
+            )
+        except Exception:
+            metrics = {}
+        if isinstance(metrics, dict):
+            logger.info(
+                "【スクロール終了】scrollTop=%s scrollHeight=%s clientHeight=%s",
+                metrics.get("scrollTop", "?"),
+                metrics.get("scrollHeight", "?"),
+                metrics.get("clientHeight", "?"),
+            )
+
+    def _log_oldest_first_sort_debug(
+        self, tab_name: str, ordered: list[Member]
+    ) -> None:
+        if not self._member_extraction_debug_enabled() or not ordered:
+            return
+        logger.info("【%s】古い順ソート結果（全%d件）", tab_name, len(ordered))
+        for i, member in enumerate(ordered, 1):
+            last_sent = (
+                member.last_sent.isoformat()
+                if member.last_sent
+                else "（履歴なし）"
+            )
+            logger.info(
+                "%d. member_id=%s 名前=%s last_sent=%s",
+                i,
+                member.member_id,
+                member.name,
+                last_sent,
+            )
+
+    def _log_debug_run_summary(self) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        logger.info("====== 実行終了デバッグサマリー ======")
+        logger.info("送信成功: %s", self._debug_run_sent_success)
+        logger.info("送信失敗: %s", self._debug_run_sent_failed)
+        logger.info("送信対象外: %s", self._debug_run_excluded)
 
     def _send_member_keys_phase(
         self,
@@ -2192,32 +3324,72 @@ class MiteneSender:
         budget: int,
         sent: int,
         sent_by_step: dict[str, int],
+        *,
+        members: list[Member] | None = None,
     ) -> int:
         """キーリストをキューに載せて残り回数ぶん送信."""
+        self._check_job_control()
+        tab_name = self._current_step.tab if self._current_step else "一覧"
         if sent >= budget or not keys:
+            if not keys:
+                self._log_pipeline_funnel_queue(tab_name, 0)
             return sent
+        if members:
+            self._log_final_send_targets(members, label)
+            if self._member_extraction_debug_enabled():
+                for member in members:
+                    self._remember_debug_member_name(member.member_id, member.name)
         self._send_button_queue = [k for k in keys if k not in self._sent_member_keys]
         step_limit = min(len(self._send_button_queue), budget - sent)
+        self._log_member_extraction_queue_debug(len(self._send_button_queue))
         if step_limit <= 0:
             return sent
+        self._begin_send_phase_tracking(label, self._send_button_queue[:step_limit])
         logger.info("%s: %d 人へ送信開始", label, step_limit)
-        return self._send_loop_for_step(
-            page, label, budget, sent, sent_by_step, step_limit
-        )
+        try:
+            return self._send_loop_for_step(
+                page, label, budget, sent, sent_by_step, step_limit
+            )
+        finally:
+            self._finish_send_phase_tracking()
 
-    def _merge_parsed_lists(
-        self, parsed_lists: dict[str, list[dict[str, Any]]]
-    ) -> dict[str, dict[str, Any]]:
-        """複数タブの会員を key で合算（古い送信日を優先）."""
-        merged: dict[str, dict[str, Any]] = {}
-        for cards in parsed_lists.values():
-            for card in cards:
-                if not isinstance(card, dict) or not card.get("has_send_button"):
-                    continue
-                if card.get("key") in self._sent_member_keys:
-                    continue
-                self._merge_member_card(merged, card)
-        return merged
+    def _send_oldest_first_phases(
+        self,
+        page: Page,
+        budget: int,
+        sent: int,
+        sent_by_step: dict[str, int],
+    ) -> int:
+        """⑥⑦: キープ→マッチ率を各タブ内で送信日古い順に送信."""
+        logger.info("=== フェーズ2: 送信日古い順（⑥⑦）===")
+        for label, tab, list_path in OLDEST_FIRST_PHASE_TABS:
+            if sent >= budget:
+                break
+            self._check_job_control()
+            step = PriorityStep(
+                tab=tab,
+                member_filter="sent_oldest_first",
+                list_path=list_path,
+            )
+            members, history_texts = self._fetch_tab_members(page, step)
+            filtered = self._apply_step_member_filter(
+                members, history_texts, step
+            )
+            keys = self._members_to_keys(filtered)
+            if not keys:
+                logger.info("%s: 送信対象 0 件", label)
+                continue
+            logger.info("%s: %d 人へ送信開始", label, len(keys))
+            sent = self._send_member_keys_phase(
+                page,
+                label,
+                keys,
+                budget,
+                sent,
+                sent_by_step,
+                members=filtered[: len(keys)],
+            )
+        return sent
 
     def _execute_phased_send_pipeline(
         self,
@@ -2227,13 +3399,12 @@ class MiteneSender:
         sent_by_step: dict[str, int],
         skipped_steps: list[str],
     ) -> int:
-        """フェーズ1（新規優先巡回）→ フェーズ2（全件合算バックアップ）."""
+        """フェーズ1（①〜③新規）→ ④マイガール古い順 → ⑤みたよ → ⑥⑦古い順."""
+        self._check_job_control()
         gid = self._gid()
         logger.info("=== フェーズ1: 新規会員優先巡回（gid=%s）===", gid)
 
-        parsed_lists: dict[str, list[dict[str, Any]]] = {}
-        has_any_new_member = False
-        new_matchings: list[dict[str, Any]] = []
+        new_matchings: list[Member] = []
 
         # ① キープ直打ち → マイガールタブクリック → 新規送信
         step1 = PriorityStep(
@@ -2241,15 +3412,21 @@ class MiteneSender:
             member_filter="new_only",
             list_path=MYGIRL_LIST_PATH,
         )
-        mygirl_cards = self._fetch_tab_members(page, step1)
-        parsed_lists["マイガール"] = mygirl_cards
-        new_mygirls = self._filter_new_sendable_cards(mygirl_cards)
+        mygirl_members, mygirl_hist = self._fetch_tab_members(page, step1)
+        new_mygirls = self._filter_new_members(
+            mygirl_members, mygirl_hist, step1
+        )
         if new_mygirls:
-            has_any_new_member = True
             logger.info("【1】新規マイガール %d 件 → 送信", len(new_mygirls))
-            keys = [str(m["key"]) for m in new_mygirls]
+            keys = self._members_to_keys(new_mygirls)
             sent = self._send_member_keys_phase(
-                page, "①マイガール（新規）", keys, budget, sent, sent_by_step
+                page,
+                "①マイガール（新規）",
+                keys,
+                budget,
+                sent,
+                sent_by_step,
+                members=new_mygirls,
             )
         else:
             logger.info("【1】新規マイガール 0 件")
@@ -2257,21 +3434,26 @@ class MiteneSender:
         if sent >= budget:
             return sent
 
+        self._check_job_control()
         # ② キープ一覧へ直打ち → 新規送信
         step2 = PriorityStep(
             tab="キープ",
             member_filter="new_only",
             list_path=KEEP_LIST_PATH,
         )
-        keep_cards = self._fetch_tab_members(page, step2)
-        parsed_lists["キープ"] = keep_cards
-        new_keeps = self._filter_new_sendable_cards(keep_cards)
+        keep_members, keep_hist = self._fetch_tab_members(page, step2)
+        new_keeps = self._filter_new_members(keep_members, keep_hist, step2)
         if new_keeps:
-            has_any_new_member = True
             logger.info("【2】新規キープ %d 件 → 送信", len(new_keeps))
-            keys = [str(m["key"]) for m in new_keeps]
+            keys = self._members_to_keys(new_keeps)
             sent = self._send_member_keys_phase(
-                page, "②キープ（新規）", keys, budget, sent, sent_by_step
+                page,
+                "②キープ（新規）",
+                keys,
+                budget,
+                sent,
+                sent_by_step,
+                members=new_keeps,
             )
         else:
             logger.info("【2】新規キープ 0 件")
@@ -2279,18 +3461,19 @@ class MiteneSender:
         if sent >= budget:
             return sent
 
+        self._check_job_control()
         # ③ マッチ率（新規・残り回数ぶん）
         step3 = PriorityStep(
             tab="マッチ率",
             member_filter="new_only",
             list_path="/J10ComeonAiMatchingList.php",
         )
-        match_cards = self._fetch_tab_members(page, step3)
-        parsed_lists["マッチ率"] = match_cards
-        new_matchings = self._filter_new_sendable_cards(match_cards)
+        match_members, match_hist = self._fetch_tab_members(page, step3)
+        new_matchings = self._filter_new_members(
+            match_members, match_hist, step3
+        )
         self._match_rate_had_new = len(new_matchings) > 0
         if new_matchings:
-            has_any_new_member = True
             limit = budget - sent
             batch = new_matchings[:limit]
             logger.info(
@@ -2298,9 +3481,15 @@ class MiteneSender:
                 len(new_matchings),
                 len(batch),
             )
-            keys = [str(m["key"]) for m in batch]
+            keys = self._members_to_keys(batch)
             sent = self._send_member_keys_phase(
-                page, "③マッチ率（新規）", keys, budget, sent, sent_by_step
+                page,
+                "③マッチ率（新規）",
+                keys,
+                budget,
+                sent,
+                sent_by_step,
+                members=batch,
             )
         else:
             logger.info("【3】新規マッチ率 0 件")
@@ -2308,76 +3497,70 @@ class MiteneSender:
         if sent >= budget:
             return sent
 
-        # ④ みたよ（③で新規マッチ率0件のときのみ全員送信）
+        self._check_job_control()
+        # ④ マイガール（送信日古い順）
         step4 = PriorityStep(
+            tab="マイガール",
+            member_filter="sent_oldest_first",
+            list_path=MYGIRL_LIST_PATH,
+        )
+        mygirl_members2, mygirl_hist2 = self._fetch_tab_members(page, step4)
+        mygirl_ordered = self._apply_step_member_filter(
+            mygirl_members2, mygirl_hist2, step4
+        )
+        if mygirl_ordered:
+            keys = self._members_to_keys(mygirl_ordered)
+            logger.info("【4】マイガール（古い順） %d 件 → 送信", len(keys))
+            sent = self._send_member_keys_phase(
+                page,
+                "④マイガール（古い順）",
+                keys,
+                budget,
+                sent,
+                sent_by_step,
+                members=mygirl_ordered[: len(keys)],
+            )
+        else:
+            logger.info("【4】マイガール（古い順）送信対象 0 件")
+
+        if sent >= budget:
+            return sent
+
+        self._check_job_control()
+        # ⑤ みたよ（③で新規マッチ率0件のときのみ）
+        step5 = PriorityStep(
             tab="みたよ",
             member_filter="sendable",
             list_path="/J10ComeonVisitorList.php",
         )
-        visitor_cards = self._fetch_tab_members(page, step4)
-        parsed_lists["みたよ"] = visitor_cards
+        visitor_members, visitor_hist = self._fetch_tab_members(page, step5)
         if not new_matchings:
-            sendable = self._filter_sendable_cards(visitor_cards)
+            sendable = self._filter_sendable_members(
+                visitor_members, visitor_hist, step5
+            )
             if sendable:
-                logger.info("【4】みたよ全員 %d 件 → 送信", len(sendable))
-                keys = [str(m["key"]) for m in sendable]
+                logger.info("【5】みたよ %d 件 → 送信", len(sendable))
+                keys = self._members_to_keys(sendable)
                 sent = self._send_member_keys_phase(
-                    page, "④みたよ（全員）", keys, budget, sent, sent_by_step
+                    page,
+                    "⑤みたよ",
+                    keys,
+                    budget,
+                    sent,
+                    sent_by_step,
+                    members=sendable,
                 )
             else:
-                logger.info("【4】みたよ送信対象 0 件")
+                logger.info("【5】みたよ送信対象 0 件")
         else:
             logger.info("【SKIP】マッチ率に新規あり → みたよはスキップ")
 
         if sent >= budget:
             return sent
 
-        # ⑤ マイガール全会員（送信日古い順）— 新規が1人でもいた場合のみ
-        if has_any_new_member:
-            logger.info("【5】マイガール全会員を送信日古い順に送信")
-            step5 = PriorityStep(
-                tab="マイガール",
-                member_filter="sent_oldest_first",
-                list_path=MYGIRL_LIST_PATH,
-            )
-            mygirl_all = self._fetch_tab_members(page, step5)
-            parsed_lists["マイガール"] = mygirl_all
-            keys = self._sort_all_members_oldest_first_keys(mygirl_all)
-            sent = self._send_member_keys_phase(
-                page, "⑤マイガール（古い順）", keys, budget, sent, sent_by_step
-            )
-        else:
-            logger.info("【5】新規0件のためスキップ（フェーズ2バックアップへ）")
-            skipped_steps.append("⑤マイガール（古い順）（バックアップへ）")
-
-        # フェーズ2: 新規が全タブで0件 → 4URL合算・送信日古い順
-        if not has_any_new_member and sent < budget:
-            logger.warning(
-                "全タブに新規会員0件 — バックアップ（全URL合算・古い順）へ切替"
-            )
-            merged = self._merge_parsed_lists(parsed_lists)
-            if not merged:
-                for tab_name, list_path in AGGREGATE_LIST_TABS:
-                    step = PriorityStep(
-                        tab=tab_name,
-                        list_path=list_path,
-                        member_filter="sendable",
-                    )
-                    cards = self._fetch_tab_members(page, step)
-                    parsed_lists[tab_name] = cards
-                merged = self._merge_parsed_lists(parsed_lists)
-
-            keys = self._sort_all_members_oldest_first_keys(list(merged.values()))
-            sent = self._send_member_keys_phase(
-                page,
-                "★全タブ合算（古い順）",
-                keys,
-                budget,
-                sent,
-                sent_by_step,
-            )
-            if not keys:
-                skipped_steps.append("★全タブ合算（対象なし）")
+        sent = self._send_oldest_first_phases(
+            page, budget, sent, sent_by_step
+        )
 
         logger.info("本日の送信巡回ルート完了（送信 %d / 目標 %d）", sent, budget)
         return sent
@@ -2440,9 +3623,13 @@ class MiteneSender:
                 or (path and self._is_on_step_list_page(page, path))
             ):
                 return False
+            pre_count = self._prepare_list_page_before_collect(page, step.tab)
+            self._log_list_page_before_parse(
+                page, step.tab, pre_count, step=step
+            )
             self._scroll_member_list_to_end(page)
             page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(300)
+            self._pause_ms(300)
             return True
 
         if not self._navigate_to_url_safe(page, step, force_reload=True):
@@ -2525,10 +3712,11 @@ class MiteneSender:
         """会員探し画面（Pick Up・横タブ）が出るまで待つ."""
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
+            self._check_job_control()
             for surface in self._iter_surfaces(page):
                 if self._pickup_tab_bar_visible(surface):
                     return True
-            page.wait_for_timeout(400)
+            self._pause_ms(400)
         snippet = ""
         try:
             snippet = (page.inner_text("body") or "")[:400]
@@ -2575,12 +3763,18 @@ class MiteneSender:
                         };
                         const isTabAnchor = (a) => {
                             const href = (a.getAttribute('href') || '').toLowerCase();
-                            if (!href.includes('comeon')) return false;
+                            const text = (a.innerText || '').trim();
                             const r = a.getBoundingClientRect();
-                            if (r.width < 20 || r.height < 12 || r.top > window.innerHeight * 0.35) {
+                            if (r.width < 20 || r.height < 12
+                                || r.top > window.innerHeight * 0.35) {
                                 return false;
                             }
-                            return true;
+                            if (href.includes('comeon')) return true;
+                            if ((href.includes('girluserpage') || href.includes('tab='))
+                                && (text === tabName || tabLabels.includes(text))) {
+                                return true;
+                            }
+                            return false;
                         };
                         // 1) href が一致する ul.tab / .kitene_ranking 内の <a>
                         if (pathSlug) {
@@ -2721,159 +3915,6 @@ class MiteneSender:
         except Exception:
             return False
 
-    def _step_send_limit(self, step: PriorityStep, initial_budget: int, sent: int) -> int:
-        """このタブで送れる最大件数（残り回数・タブ上限の小さい方）."""
-        remaining = max(0, initial_budget - sent)
-        if step.max_members > 0:
-            return min(step.max_members, remaining)
-        return remaining
-
-    def _tab_has_increase(self, page: Page, tab_name: str) -> bool:
-        """タブ付近に増加・新着・数字バッジがあるか."""
-        try:
-            return bool(
-                page.evaluate(
-                    """(tabName) => {
-                        const tabLabels = ['みたよ','マイガール','口コミ','キープ','マッチ率','ミテネ履歴'];
-                        for (const row of document.querySelectorAll(
-                            'ul, ol, nav, div, [class*="tab"], [class*="nav"]'
-                        )) {
-                            const items = [...row.querySelectorAll('a, li, span, button, div')];
-                            const tabs = items.filter(el => {
-                                const t = (el.innerText || '').trim();
-                                return tabLabels.includes(t) || t.startsWith(tabName);
-                            });
-                            if (tabs.length < 3) continue;
-                            for (const el of items) {
-                                const t = (el.innerText || '').trim();
-                                if (!t.includes(tabName)) continue;
-                                if (/新着|NEW|増|↑|\\+/.test(t)) return true;
-                                const nums = t.match(/\\d+/g);
-                                if (nums && nums.some(n => parseInt(n, 10) > 0)) return true;
-                                const sib = el.parentElement;
-                                if (sib) {
-                                    const block = (sib.innerText || '').trim();
-                                    if (block.includes(tabName) && /\\d+/.test(block)) return true;
-                                }
-                            }
-                        }
-                        for (const el of document.querySelectorAll('a, button, li, span, [role="tab"]')) {
-                            const t = (el.innerText || '').trim();
-                            if (!t.includes(tabName)) continue;
-                            if (/新着|NEW|増|↑|\\+/.test(t)) return true;
-                            const nums = t.match(/\\d+/g);
-                            if (nums && nums.some(n => parseInt(n, 10) > 0)) return true;
-                        }
-                        return false;
-                    }""",
-                    tab_name,
-                )
-            )
-        except Exception:
-            return False
-
-    def _step_should_run(
-        self, page: Page, step: PriorityStep, *, after_open: bool = False
-    ) -> bool:
-        cond = step.condition or "always"
-        if cond == "always":
-            return True
-        if cond == "if_new_exists":
-            if after_open:
-                n = self._count_new_members_on_page(page)
-            else:
-                if not self._open_step_list(page, step):
-                    return False
-                n = self._count_new_members_on_page(page)
-            if n > 0:
-                logger.info("【%s】未送信会員 %d 人 → 送信対象", step.tab, n)
-                return True
-            logger.info("【%s】未送信会員なしのためスキップ", step.tab)
-            return False
-        if cond == "if_no_match_new":
-            if self._match_rate_had_new is None:
-                logger.info("【%s】マッチ率の新規判定前のためスキップ", step.tab)
-                return False
-            if self._match_rate_had_new:
-                logger.info(
-                    "【%s】マッチ率に新規があるためスキップ", step.tab
-                )
-                return False
-            logger.info("【%s】マッチ率新規なし → みたよを対象", step.tab)
-            return True
-        if cond == "increased":
-            if self._tab_has_increase(page, step.tab):
-                return True
-            logger.info("タブ「%s」に増加表示がないためスキップ", step.tab)
-            return False
-        return True
-
-    def _switch_tab(
-        self, page: Page, tab_name: str, *, list_path: str = ""
-    ) -> bool:
-        logger.info("タブ切替（Pick Up横タブ）: %s", tab_name)
-        page.evaluate("window.scrollTo(0, 0)")
-        self._wait_page_settled(page)
-        path = list_path or TAB_LIST_PATHS.get(tab_name, "")
-        if self._is_on_step_list_page(page, path):
-            logger.info("タブ「%s」は既に一覧表示中", tab_name)
-            return True
-        if self._is_active_tab(page, tab_name) and self._is_on_step_list_page(page, path):
-            logger.info("タブ「%s」は既に選択中", tab_name)
-            return True
-
-        self._scroll_tab_bar(page)
-        for surface in self._iter_surfaces(page):
-            if self._click_pickup_list_tab(
-                surface, tab_name, list_path=path
-            ):
-                self._wait_page_settled(page)
-                self.human.tab_switch_pause()
-                self.human.browse_list(page)
-                if self._is_member_profile_page(page):
-                    logger.warning(
-                        "タブ「%s」クリック後に会員プロフィールへ遷移: %s",
-                        tab_name,
-                        page.url,
-                    )
-                    return False
-                logger.info("タブ「%s」を切り替えました: %s", tab_name, page.url)
-                return True
-            loc = surface.get_by_text(tab_name, exact=True)
-            for i in range(self._safe_count(loc)):
-                try:
-                    el = loc.nth(i)
-                    if not el.is_visible():
-                        continue
-                    tag = el.evaluate("el => el.tagName.toLowerCase()")
-                    if tag != "a":
-                        continue
-                    href = el.get_attribute("href") or ""
-                    if path and self._list_path_slug(path) not in href.lower():
-                        continue
-                    box = el.bounding_box()
-                    vh = (page.viewport_size or {}).get("height", 844)
-                    if box and box["y"] > vh * 0.35:
-                        continue
-                    el.scroll_into_view_if_needed(timeout=3000)
-                    el.click(timeout=5000)
-                    self._wait_page_settled(page)
-                    self.human.tab_switch_pause()
-                    if self._is_member_profile_page(page):
-                        return False
-                    logger.info("タブ「%s」をPlaywrightでクリック", tab_name)
-                    return True
-                except Exception:
-                    continue
-
-        logger.warning(
-            "タブ「%s」が見つかりません: %s",
-            tab_name,
-            self._page_debug_hint(page),
-        )
-        self._save_debug_screenshot(page, f"tab-{tab_name}")
-        return False
-
     def _activate_sub_tab(self, page: Page, sub_name: str) -> bool:
         """マッチ率内の「新規」などサブタブを開く."""
         logger.info("サブタブ: %s", sub_name)
@@ -2954,6 +3995,7 @@ class MiteneSender:
         failed_attempts = 0
         max_failed = max(step_limit * 3, 15)
         while sent < initial_budget and step_sent < step_limit:
+            self._check_job_control()
             if failed_attempts >= max_failed:
                 logger.warning(
                     "%s: 失敗が %d 回に達したため中断",
@@ -2975,6 +4017,7 @@ class MiteneSender:
                 stall = 0
                 continue
             if not self._send_one_mitene(page):
+                self._record_send_attempt_from_last()
                 failed_attempts += 1
                 stall += 1
                 if stall >= 5:
@@ -2982,6 +4025,7 @@ class MiteneSender:
                     self._refresh_send_button_queue(page, log_scan=False)
                     stall = 0
                 continue
+            self._record_send_attempt_from_last()
             failed_attempts = 0
             stall = 0
             scroll_rounds = 0
@@ -2989,6 +4033,7 @@ class MiteneSender:
             step_sent += 1
             sent_by_step[label] += 1
             self._send_done = sent
+            self._emit_send_progress(sent, initial_budget)
             logger.info(
                 "1件送信完了（%d / %d・%s %d/%d）",
                 sent,
@@ -3005,29 +4050,38 @@ class MiteneSender:
     def _page_has_send_targets(self, page: Page) -> bool:
         if self._count_mitene_send_buttons(page) > 0:
             return True
-        return len(self._scan_member_cards(page)) > 0
+        step = self._current_step
+        if self._is_member_profile_page(page):
+            if step:
+                uids = self._collect_profile_tab_uids(page, step)
+                if len(uids) > 1:
+                    return True
+            return self._count_mitene_send_buttons(page) > 0
+        if self._is_on_comeon_list_page(page):
+            tab = self._tab_name_from_page(page)
+            members, _histories = self.collect_members(page, tab, quiet=True)
+            return any(m.has_send_button for m in members)
+        fallback = self._scan_send_buttons_fallback(page)
+        return len(fallback) > 0
 
-    def _wait_for_step_members(
-        self, page: Page, step: PriorityStep | None, *, timeout_ms: int = 15000
+    def _wait_profile_tab_ready(
+        self,
+        page: Page,
+        step: PriorityStep,
+        *,
+        timeout_ms: int = 16000,
     ) -> bool:
-        """ステップ条件に合う会員が DOM に出るまで待つ."""
+        """プロフィール型タブの読み込み待ち（再帰なし）."""
         deadline = time.monotonic() + timeout_ms / 1000
-        mode = (step.member_filter if step else "sendable") or "sendable"
+        surface = self._member_card_surface(page)
         while time.monotonic() < deadline:
-            members = _member_dicts_only(self._scan_member_cards(page))
-            if members:
-                if mode == "new_only":
-                    if any(not m.get("sent_history") for m in members):
-                        return True
-                    return True
-                if mode == "sent_oldest_first":
-                    if any(m.get("sent_history") for m in members):
-                        return True
-                    return True
+            self._check_job_control()
+            uids = self._collect_profile_tab_uids(page, step)
+            btn_n = self._count_mitene_send_buttons(page)
+            card_n = self._count_member_cards_on_surface(surface)
+            if len(uids) > 1 or btn_n > 0 or card_n > 0:
                 return True
-            if self._count_mitene_send_buttons(page) > 0:
-                return True
-            page.wait_for_timeout(400)
+            self._pause_ms(500)
         return False
 
     def _kitene_send_wait_ms(self) -> int:
@@ -3041,13 +4095,6 @@ class MiteneSender:
             f".u_{member_id} a.kitene_send_btn__text_wrapper, "
             f'a[onclick*="registComeon({member_id})"]'
         )
-
-    def _history_has_sent_date(self, history_text: str) -> bool:
-        """ミテネ履歴の値に送信日・送信済がある."""
-        text = (history_text or "").strip()
-        if not text:
-            return False
-        return bool(MITENE_HISTORY_SENT_VALUE.search(text))
 
     def _parse_history_date(self, history_text: str) -> date | None:
         """ミテネ履歴から送信日を抽出（古い順ソート用）."""
@@ -3068,6 +4115,7 @@ class MiteneSender:
     def _invalidate_list_cache(self) -> None:
         self._cached_list_cards = None
         self._cached_list_url = ""
+        self._profile_uid_by_key.clear()
 
     def _count_member_cards_on_surface(self, surface: Any) -> int:
         try:
@@ -3122,35 +4170,16 @@ class MiteneSender:
             return self._current_step.tab
         return "一覧"
 
-    def _member_has_sent_mitene(self, history_text: str) -> bool:
-        """
-        kitene_question 内の「ミテネ履歴」answer に「送信済」があれば送信済み。
-        例: 2026/05/15 送信済
-        """
-        return not is_new_member_from_history(history_text)
-
-    def _card_has_sent_history(
-        self, card_text: str, history_text: str = ""
-    ) -> bool:
-        """一覧DOMのミテネ履歴（readHistory）で送信済み判定."""
-        ht = (history_text or "").strip()
-        if ht:
-            return self._member_has_sent_mitene(ht)
-        label = self.standard.mitene_history_label
-        if label in (card_text or "") and "送信済" in (card_text or ""):
-            return True
-        return False
-
     def _log_send_pipeline_info(self) -> None:
         logger.info("=== ミテネ送信パイプライン ===")
-        logger.info("対象抽出: _parse_list_page_cards → _apply_step_member_filter")
+        logger.info("対象抽出: collect_members → _apply_step_member_filter")
         logger.info(
-            "送信順決定: フェーズ1（①〜⑤）→ フェーズ2（全件合算）"
-            " / マイガール=キープ経由タブクリック"
+            "送信順決定: ①②③新規 → ④マイガール古い順 → ⑤みたよ"
+            " → ⑥⑦キープ・マッチ率古い順"
         )
         logger.info(
             "新規会員判定: div.kitene_question > span.question「ミテネ履歴」"
-            "の span.answer に「送信済」なし"
+            "の span.answer に「送信済」なし（_apply_step_member_filter のみ）"
         )
         logger.info(
             "gid=%s キープ起点=%s",
@@ -3159,195 +4188,1178 @@ class MiteneSender:
         )
         logger.info("ロジック版: %s", SEND_LOGIC_VERSION)
 
-    def _member_send_verdict(
-        self, sent_history: bool, *, step: PriorityStep | None
-    ) -> str:
-        mode = (step.member_filter if step else "sendable") or "sendable"
-        if mode == "sent_oldest_first":
-            return "送信対象" if sent_history else "除外"
-        if mode == "new_only":
-            return "除外" if sent_history else "送信対象"
-        return "送信対象"
-
-    def _log_list_cards_debug(
-        self,
-        cards: list[dict[str, Any]],
-        tab_name: str,
-        step: PriorityStep | None,
-    ) -> None:
-        logger.info(
-            "【%s一覧】カード解析 %d 件（一覧DOM・LazyLoad後）",
-            tab_name,
-            len(cards),
+    def _member_extraction_debug_enabled(self) -> bool:
+        if self.standard.member_extraction_debug:
+            return True
+        return os.environ.get("MITENE_MEMBER_EXTRACTION_DEBUG", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
-        for card in cards:
-            if not isinstance(card, dict):
-                continue
-            sent_history = bool(card.get("sent_history"))
-            verdict = self._member_send_verdict(sent_history, step=step)
-            hist_label = "履歴あり" if sent_history else "履歴なし"
-            logger.info("[%s]", tab_name)
-            logger.info("%s", card.get("name") or "（名前不明）")
-            logger.info("uid=%s", card.get("uid") or card.get("mid") or "-")
-            logger.info("%s", hist_label)
-            logger.info("%s", verdict)
-            logger.info("innerText=%s", card.get("card_text") or "")
+
+    def _ajax_list_load_wait(self) -> None:
+        """Ajax 遅延読込待ち（scrollHeight だけでは足りないため 2〜3 秒）."""
+        self._pause_ms(random.randint(*LIST_AJAX_LOAD_WAIT_MS))
+
+    def _scroll_list_to_bottom(self, page: Page) -> None:
+        page.evaluate(
+            "window.scrollTo(0, Math.max("
+            "document.body.scrollHeight, document.documentElement.scrollHeight))"
+        )
+
+    def _get_list_scroll_height(self, page: Page) -> int:
+        try:
+            return int(
+                page.evaluate(
+                    """() => Math.max(
+                        document.body.scrollHeight,
+                        document.documentElement.scrollHeight
+                    )"""
+                )
+            )
+        except Exception:
+            return 0
+
+    def _parse_tab_member_total_count(
+        self, page: Page, tab_name: str
+    ) -> int | None:
+        """一覧またはホームに表示される「現在の○○数」を取得."""
+        pat = TAB_MEMBER_TOTAL_PATTERNS.get(tab_name)
+        if not pat:
+            return None
+        try:
+            text = _normalize_digits(page.inner_text("body") or "")
+            m = pat.search(text)
+            if m:
+                raw = m.group(1).replace(",", "").replace("，", "")
+                return int(raw)
+        except Exception:
+            pass
+        return None
+
+    def _log_list_fetch_vs_expected(
+        self, tab_name: str, fetched: int, expected: int
+    ) -> None:
+        if self._counts_roughly_match(fetched, expected, tolerance=0.02):
             logger.info(
-                "innerHTML(先頭500)=%s",
-                card.get("card_html_head") or "",
+                "【%s】取得件数 %d / %d（照合OK）", tab_name, fetched, expected
+            )
+            return
+        logger.warning("【%s】取得件数 %d / %d", tab_name, fetched, expected)
+        logger.warning("【%s】まだ一覧取得が不足しています", tab_name)
+
+    def _scroll_merge_parse_enabled(self) -> bool:
+        """スクロール走査マージは解析漏れ調査用の暫定実装（通常オフ）."""
+        if self.standard.member_scroll_merge_parse:
+            return True
+        return os.environ.get("MITENE_SCROLL_MERGE_PARSE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def _counts_roughly_match(self, a: int, b: int, *, tolerance: float = 0.02) -> bool:
+        if a <= 0 and b <= 0:
+            return True
+        if a <= 0 or b <= 0:
+            return False
+        return abs(a - b) <= max(2, int(a * tolerance))
+
+    def _log_collect_count_verification(
+        self,
+        tab_name: str,
+        *,
+        stable_card_count: int,
+        dom_count: int,
+        member_count: int,
+        parse_mode: str,
+    ) -> None:
+        """スクロール後カード数と最終 Member 数の照合（単回解析で十分か検証）."""
+        logger.info("【%s】件数照合", tab_name)
+        logger.info("  解析方式: %s", parse_mode)
+        logger.info("  DOM安定後カード数: %d", stable_card_count)
+        logger.info("  DOM解析: %d", dom_count)
+        logger.info("  Member生成: %d", member_count)
+        dom_ok = self._counts_roughly_match(stable_card_count, dom_count)
+        mem_ok = self._counts_roughly_match(stable_card_count, member_count)
+        if dom_ok and mem_ok:
+            logger.info("  照合結果: ほぼ一致")
+            return
+        logger.warning(
+            "  照合結果: 不一致（カード %d → DOM %d → Member %d）",
+            stable_card_count,
+            dom_count,
+            member_count,
+        )
+        if not self._scroll_merge_parse_enabled():
+            logger.warning(
+                "  調査時のみ MITENE_SCROLL_MERGE_PARSE=1 または"
+                " config member_scroll_merge_parse: true で走査マージを有効化"
             )
 
-    def _log_tab_parse_summary(
+    def _log_collect_stage_debug(
+        self, tab_name: str, stage: str, page: Page | None = None
+    ) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        if stage == "URL" and page is not None:
+            logger.info("【%s】URL: %s", tab_name, page.url or "")
+        else:
+            logger.info("【%s】%s", tab_name, stage)
+
+    def _log_no_send_button_members_debug(self, members: list[Member]) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        no_btn = [m for m in members if not m.has_send_button]
+        if not no_btn:
+            return
+        logger.info("↓")
+        logger.info("送信ボタンなし会員")
+        for member in no_btn:
+            dom = self._debug_member_dom.get(member.member_id, {})
+            logger.info("%s", member.member_id)
+            logger.info("%s", member.name)
+            logger.info("innerText: %s", dom.get("inner_text") or "（未取得）")
+            logger.info(
+                "outerHTML先頭300: %s",
+                (dom.get("outer_html") or "（未取得）")[:300],
+            )
+
+    def _remember_debug_member_name(self, member_id: str, name: str) -> None:
+        mid = (member_id or "").strip()
+        if mid:
+            self._debug_member_names[mid] = name or "（名前不明）"
+
+    def _log_per_send_debug_header(self, member_id: str, name: str) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        logger.info("------ 送信1件デバッグ ------")
+        logger.info("member_id: %s", member_id)
+        logger.info("名前: %s", name)
+
+    def _log_per_send_debug_success(
+        self,
+        *,
+        cta_ok: bool,
+        modal_shown: bool,
+        ok_clicked: bool,
+        remaining_before: int | None,
+        remaining_after: int | None,
+    ) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        logger.info("CTAクリック成功: %s", "はい" if cta_ok else "いいえ")
+        logger.info("確認モーダル表示: %s", "はい" if modal_shown else "いいえ")
+        logger.info("OKクリック: %s", "はい" if ok_clicked else "いいえ")
+        if remaining_before is not None and remaining_after is not None:
+            logger.info("残回数: %s→%s", remaining_before, remaining_after)
+        else:
+            logger.info(
+                "残回数: %s→%s",
+                remaining_before if remaining_before is not None else "?",
+                remaining_after if remaining_after is not None else "?",
+            )
+        logger.info("送信成功")
+
+    def _log_per_send_debug_failure(
+        self,
+        *,
+        cta_ok: bool,
+        modal_shown: bool,
+        ok_clicked: bool,
+        remaining_before: int | None,
+        remaining_after: int | None,
+        reason: str,
+    ) -> None:
+        if not self._member_extraction_debug_enabled():
+            return
+        logger.info("CTAクリック成功: %s", "はい" if cta_ok else "いいえ")
+        logger.info("確認モーダル表示: %s", "はい" if modal_shown else "いいえ")
+        logger.info("OKクリック: %s", "はい" if ok_clicked else "いいえ")
+        if remaining_before is not None and remaining_after is not None:
+            logger.info("残回数: %s→%s", remaining_before, remaining_after)
+        else:
+            logger.info(
+                "残回数: %s→%s",
+                remaining_before if remaining_before is not None else "?",
+                remaining_after if remaining_after is not None else "?",
+            )
+        logger.info("送信失敗理由: %s", reason)
+
+    def _member_filter_exclusion_reason(self, member: Member, mode: str) -> str:
+        key = member_queue_key(member.member_id)
+        if key in self._sent_member_keys:
+            return "本実行で送信済"
+        if key in self._failed_member_keys:
+            return "送信失敗"
+        if not member.has_send_button:
+            return "送信ボタンなし"
+        if mode == "new_only" and member.sent_history:
+            return "送信済"
+        if mode == "sent_oldest_first" and not member.sent_history:
+            return "送信履歴なし"
+        return "フィルタ条件不一致"
+
+    def _build_filter_exclusions(
+        self,
+        enriched: list[Member],
+        filtered: list[Member],
+        step: PriorityStep,
+        *,
+        duplicates: list[Member] | None = None,
+    ) -> list[tuple[Member, str]]:
+        mode = step.member_filter or "sendable"
+        filtered_ids = {m.member_id for m in filtered}
+        seen: set[str] = set()
+        exclusions: list[tuple[Member, str]] = []
+        for member in duplicates or []:
+            if not member.member_id or member.member_id in seen:
+                continue
+            seen.add(member.member_id)
+            exclusions.append((member, "重複"))
+        for member in enriched:
+            if member.member_id in filtered_ids or member.member_id in seen:
+                continue
+            seen.add(member.member_id)
+            exclusions.append(
+                (member, self._member_filter_exclusion_reason(member, mode))
+            )
+        return exclusions
+
+    def _log_member_extraction_debug(
+        self,
+        step: PriorityStep,
+        members: list[Member],
+        enriched: list[Member],
+        filtered: list[Member],
+        *,
+        duplicates: list[Member] | None = None,
+    ) -> None:
+        """デバッグモード: タブごとの抽出〜フィルタ漏斗ログ."""
+        tab = step.tab
+        total = len(members)
+        with_btn = sum(1 for m in members if m.has_send_button)
+        sent_n = sum(1 for m in enriched if m.sent_history)
+        unsent_n = sum(
+            1 for m in enriched if m.has_send_button and not m.sent_history
+        )
+        exclusions = self._build_filter_exclusions(
+            enriched, filtered, step, duplicates=duplicates
+        )
+
+        logger.info("======================")
+        logger.info("%s", tab)
+        logger.info("======================")
+        logger.info("取得カード数: %d", total)
+        logger.info("↓")
+        logger.info("送信ボタンあり: %d", with_btn)
+        logger.info("↓")
+        logger.info("送信済: %d", sent_n)
+        logger.info("↓")
+        logger.info("未送信: %d", unsent_n)
+        logger.info("↓")
+        logger.info("Filter後: %d", len(filtered))
+        if exclusions:
+            logger.info("↓")
+            logger.info("除外")
+            for member, reason in exclusions:
+                logger.info("%s", member.member_id)
+                logger.info("%s", member.name)
+                logger.info("理由：%s", reason)
+        if filtered:
+            logger.info("↓")
+            logger.info("送信対象")
+            for member in filtered:
+                logger.info("%s", member.member_id)
+                logger.info("%s", member.name)
+                self._remember_debug_member_name(member.member_id, member.name)
+        self._log_no_send_button_members_debug(members)
+
+    def _count_list_cards_on_page(self, page: Page) -> int:
+        return self._count_member_cards_on_surface(self._member_card_surface(page))
+
+    def _ensure_on_step_list_for_parse(
+        self, page: Page, step: PriorityStep
+    ) -> bool:
+        """解析前に J10 一覧URL上にいることを保証する（プロフィールURLは不可）."""
+        for attempt in range(1, 4):
+            on_profile = self._is_member_profile_page(page)
+            verified = self._verify_step_list(page, step)
+            logger.info(
+                "【%s】一覧確認 (試行%d): URL=%s"
+                " _is_member_profile_page=%s _verify_step_list=%s",
+                step.tab,
+                attempt,
+                page.url or "",
+                on_profile,
+                verified,
+            )
+            if not on_profile and verified:
+                return True
+            if on_profile:
+                logger.warning(
+                    "【%s】プロフィールページ上だったため一覧へ戻します",
+                    step.tab,
+                )
+            else:
+                logger.warning(
+                    "【%s】一覧未確認のため一覧を開き直します",
+                    step.tab,
+                )
+            if not self._open_step_list(page, step):
+                self._navigate_to_url_safe(page, step, force_reload=True)
+            self._pause_ms(500)
+        on_profile = self._is_member_profile_page(page)
+        verified = self._verify_step_list(page, step)
+        if not on_profile and verified:
+            return True
+        logger.warning(
+            "【%s】一覧ページへ戻せません: URL=%s profile=%s verify=%s",
+            step.tab,
+            page.url or "",
+            on_profile,
+            verified,
+        )
+        return False
+
+    def _ensure_list_from_profile(self, page: Page, tab_name: str) -> None:
+        """プロフィールページなら J10 一覧へ戻る（全タブ共通）."""
+        if not self._is_member_profile_page(page):
+            return
+        step = self._current_step
+        logger.info("【%s】プロフィールページのため一覧へ戻る", tab_name)
+        if step and step.tab == tab_name:
+            if self._open_step_list(page, step):
+                self._wait_page_settled(page, quick=True)
+                return
+            self._navigate_to_url_safe(page, step, force_reload=True)
+            return
+        path = TAB_LIST_PATHS.get(tab_name, "")
+        if path:
+            url = self._list_url(page, path)
+            if url and self._safe_goto(page, url):
+                self._wait_page_settled(page, quick=True)
+
+    def _is_list_loading_visible(self, page: Page) -> bool:
+        try:
+            return not bool(page.evaluate(LIST_LOADING_GONE_JS))
+        except Exception:
+            return False
+
+    def _poll_wait_for_list_render(
+        self, page: Page, tab_name: str
+    ) -> tuple[int, bool]:
+        """
+        500ms ごとに会員カード数・ローディング状態を確認（最大8秒）。
+        カード1件以上で終了。タイムアウトしても続行。
+        """
+        deadline = time.monotonic() + LIST_RENDER_WAIT_MAX_MS / 1000
+        card_n = 0
+        poll = 0
+        while time.monotonic() < deadline:
+            self._check_job_control()
+            poll += 1
+            card_n = self._count_list_cards_on_page(page)
+            loading = self._is_list_loading_visible(page)
+            if card_n > 0:
+                logger.info(
+                    "【%s】一覧描画待機完了: カード %d件"
+                    "（%d ms・poll %d）",
+                    tab_name,
+                    card_n,
+                    poll * LIST_RENDER_POLL_MS,
+                    poll,
+                )
+                return card_n, True
+            if not loading and poll > 1:
+                logger.debug(
+                    "【%s】ローディング終了・カード未検出"
+                    "（poll %d・継続待機）",
+                    tab_name,
+                    poll,
+                )
+            self._pause_ms(LIST_RENDER_POLL_MS)
+        logger.warning(
+            "【%s】一覧描画待機タイムアウト（%d秒）"
+            " 最終カード数=%d",
+            tab_name,
+            LIST_RENDER_WAIT_MAX_MS // 1000,
+            card_n,
+        )
+        return card_n, False
+
+    def _log_list_page_before_parse(
+        self,
+        page: Page,
+        tab_name: str,
+        card_count: int,
+        *,
+        step: PriorityStep | None = None,
+    ) -> None:
+        """解析開始直前の診断ログ（全タブ共通）."""
+        try:
+            title = page.title()
+        except Exception:
+            title = ""
+        try:
+            ready_state = page.evaluate("() => document.readyState")
+        except Exception:
+            ready_state = "?"
+        on_profile = self._is_member_profile_page(page)
+        verified = (
+            self._verify_step_list(page, step)
+            if step is not None
+            else None
+        )
+        logger.info("【%s】解析開始直前", tab_name)
+        logger.info("  URL: %s", page.url or "")
+        logger.info("  _is_member_profile_page(): %s", on_profile)
+        if verified is not None:
+            logger.info("  _verify_step_list(): %s", verified)
+        logger.info("  会員カード数: %d", card_count)
+        logger.info("  ページタイトル: %s", title)
+        logger.info("  document.readyState: %s", ready_state)
+        if card_count == 0:
+            self._save_list_page_html_dump(page, tab_name)
+
+    def _save_list_page_html_dump(self, page: Page, tab_name: str) -> None:
+        """カード0件時のみ page.content() をログファイルへ保存."""
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_tab = re.sub(r"[^\w\u3040-\u30ff\u4e00-\u9fff-]+", "_", tab_name)
+        path = self.log_dir / f"list_html_{safe_tab}_{stamp}.html"
+        try:
+            html = page.content()
+            path.write_text(html, encoding="utf-8")
+            logger.warning(
+                "【%s】カード0件のため HTML を保存: %s", tab_name, path
+            )
+        except Exception as exc:
+            logger.warning("【%s】HTML保存失敗: %s", tab_name, exc)
+
+    def _prepare_list_page_before_collect(
+        self, page: Page, tab_name: str
+    ) -> int:
+        """
+        DOM解析・スクロール前の全タブ共通準備。
+        プロフィール→一覧 / 一覧描画ポーリング待機。
+        """
+        logger.info("【%s】一覧準備開始", tab_name)
+        self._ensure_list_from_profile(page, tab_name)
+        card_n, _ = self._poll_wait_for_list_render(page, tab_name)
+        return card_n
+
+    def _log_pipeline_funnel_stage(
         self,
         tab_name: str,
-        cards: list[dict[str, Any]],
-        step: PriorityStep | None,
+        label: str,
+        count: int,
+        *,
+        arrow: bool = True,
     ) -> None:
-        total = len(cards)
-        unsent = sum(
-            1 for c in cards if isinstance(c, dict) and not c.get("sent_history")
+        """抽出〜送信キューまでの段階件数（各段階必ず出力）."""
+        logger.info("【%s】%s: %d", tab_name, label, count)
+        if arrow:
+            logger.info("↓")
+
+    def _log_pipeline_funnel_queue(
+        self, tab_name: str, queue_count: int
+    ) -> None:
+        self._log_pipeline_funnel_stage(
+            tab_name, "最終送信キュー数", queue_count, arrow=False
         )
-        sent_hist = sum(
-            1 for c in cards if isinstance(c, dict) and c.get("sent_history")
+
+    def _log_member_extraction_queue_debug(self, queue_count: int) -> None:
+        tab = (
+            self._current_step.tab
+            if self._current_step
+            else self._tab_name_from_page_if_list()
         )
-        with_btn = sum(
-            1 for c in cards if isinstance(c, dict) and c.get("has_send_button")
+        self._log_pipeline_funnel_queue(tab, queue_count)
+
+    def _tab_name_from_page_if_list(self) -> str:
+        return "一覧"
+
+    def _history_text_is_sent(self, history_text: str) -> bool:
+        """一覧DOMのミテネ履歴テキストから送信済みか判定（filter専用）."""
+        return not is_new_member_from_history((history_text or "").strip())
+
+    def _enrich_member_sent_fields(
+        self, member: Member, history_text: str
+    ) -> Member:
+        sent = self._history_text_is_sent(history_text)
+        last_sent = (
+            self._parse_history_date(history_text) if sent else None
         )
-        targets = 0
-        for c in cards:
-            if not isinstance(c, dict) or not c.get("has_send_button"):
-                continue
-            if self._member_send_verdict(
-                bool(c.get("sent_history")), step=step
-            ) == "送信対象":
-                targets += 1
-        stats = {
-            "tab": tab_name,
-            "total": total,
-            "unsent": unsent,
-            "sent_history": sent_hist,
-            "with_send_button": with_btn,
-            "send_targets": targets,
-        }
-        self._last_tab_parse_stats = stats
-        logger.info(
-            "【%s】取得 %d 件 / 未送信 %d / 送信履歴あり %d / "
-            "送信ボタン %d / 送信対象 %d 件",
+        return Member(
+            member_id=member.member_id,
+            name=member.name,
+            has_send_button=member.has_send_button,
+            sent_history=sent,
+            last_sent=last_sent,
+        )
+
+    def _log_final_send_targets(
+        self, members: list[Member], reason: str
+    ) -> None:
+        if not members:
+            return
+        logger.info("送信対象")
+        for i, member in enumerate(members, 1):
+            logger.info("%d.", i)
+            logger.info("member_id=%s", member.member_id)
+            logger.info("名前: %s", member.name)
+            logger.info("送信理由: %s", reason)
+
+    def collect_members(
+        self,
+        page: Page,
+        tab_name: str,
+        *,
+        quiet: bool = False,
+        list_prepared: bool = False,
+        pre_card_count: int | None = None,
+    ) -> tuple[list[Member], dict[str, str]]:
+        """
+        タブの会員一覧を収集する共通入口。
+        一覧描画待機 → スクロール → DOM解析 → Member 生成。
+        """
+        step = self._current_step
+        if list_prepared:
+            pre_count = (
+                pre_card_count
+                if pre_card_count is not None
+                else self._count_list_cards_on_page(page)
+            )
+        else:
+            pre_count = self._prepare_list_page_before_collect(page, tab_name)
+            if (
+                step
+                and step.tab == tab_name
+                and not self._ensure_on_step_list_for_parse(page, step)
+            ):
+                logger.warning(
+                    "【%s】一覧ページを確認できないため解析を中止", tab_name
+                )
+                return [], {}
+            self._log_list_page_before_parse(
+                page, tab_name, pre_count, step=step
+            )
+            if step and step.tab == tab_name:
+                if self._is_member_profile_page(page) or not self._verify_step_list(
+                    page, step
+                ):
+                    logger.warning(
+                        "【%s】一覧でないため解析を中止: %s",
+                        tab_name,
+                        page.url,
+                    )
+                    return [], {}
+        debug_on = self._member_extraction_debug_enabled()
+        self._log_pipeline_funnel_stage(
             tab_name,
-            total,
-            unsent,
-            sent_hist,
-            with_btn,
-            targets,
+            "スクロール前カード数",
+            pre_count,
         )
+        if debug_on:
+            self._log_collect_stage_debug(tab_name, "URL", page)
+            self._log_collect_stage_debug(tab_name, "スクロール走査開始")
+        raw_cards = self._parse_list_page_cards(page, tab_name)
+        summary = getattr(self, "_last_list_fetch_summary", {}) or {}
+        post_count = int(summary.get("final_card_count") or len(raw_cards))
+
+        if post_count == 0 and not raw_cards:
+            logger.info(
+                "【%s】スクロール後0件 → %d秒追加待機して再取得",
+                tab_name,
+                LIST_ZERO_RETRY_WAIT_MS // 1000,
+            )
+            self._pause_ms(LIST_ZERO_RETRY_WAIT_MS)
+            pre_count = self._prepare_list_page_before_collect(page, tab_name)
+            self._log_list_page_before_parse(
+                page, tab_name, pre_count, step=step
+            )
+            if pre_count > 0:
+                self._invalidate_list_cache()
+                raw_cards = self._parse_list_page_cards(page, tab_name)
+                summary = getattr(self, "_last_list_fetch_summary", {}) or {}
+                post_count = int(
+                    summary.get("final_card_count") or len(raw_cards)
+                )
+
+        if post_count == 0 and not raw_cards:
+            logger.warning("【%s】会員0件", tab_name)
+            self._log_pipeline_funnel_stage(
+                tab_name, "スクロール後カード数", 0, arrow=False
+            )
+            return [], {}
+
+        self._log_pipeline_funnel_stage(
+            tab_name, "スクロール後カード数", post_count
+        )
+        self._log_pipeline_funnel_stage(
+            tab_name, "DOM安定後カード数", post_count
+        )
+        self._log_pipeline_funnel_stage(
+            tab_name, "DOM解析カード数", len(raw_cards)
+        )
+        if debug_on:
+            self._log_collect_stage_debug(
+                tab_name, f"カード取得完了: {len(raw_cards)}件"
+            )
+
+        members: list[Member] = []
+        history_texts: dict[str, str] = {}
+        seen: set[str] = set()
+        duplicates: list[Member] = []
+        gen_stats: dict[str, int] = {
+            "member_idなし": 0,
+            "重複": 0,
+            "不正な型": 0,
+        }
+        for card in raw_cards:
+            if not isinstance(card, dict):
+                gen_stats["不正な型"] += 1
+                continue
+            member_id = str(card.get("member_id") or "").strip()
+            if not member_id:
+                gen_stats["member_idなし"] += 1
+                continue
+            card_name = str(card.get("name") or "（名前不明）")
+            if member_id in seen:
+                gen_stats["重複"] += 1
+                dup_member = Member(
+                    member_id=member_id,
+                    name=card_name,
+                    has_send_button=bool(card.get("has_send_button")),
+                )
+                duplicates.append(dup_member)
+                if debug_on:
+                    self._log_exclusion_immediate(dup_member, "重複")
+                continue
+            seen.add(member_id)
+            history_text = str(card.get("history_text") or "").strip()
+            history_texts[member_id] = history_text
+            self._remember_debug_member_name(member_id, card_name)
+            if debug_on:
+                self._debug_member_dom[member_id] = {
+                    "inner_text": str(card.get("inner_text") or ""),
+                    "outer_html": str(card.get("outer_html") or "")[:500],
+                }
+            members.append(
+                Member(
+                    member_id=member_id,
+                    name=card_name,
+                    has_send_button=bool(card.get("has_send_button")),
+                )
+            )
+
+        self._log_member_gen_stats(tab_name, len(raw_cards), gen_stats, len(members))
+
+        if members and sum(1 for m in members if m.has_send_button) == 0:
+            fallback = self._scan_send_buttons_fallback(page)
+            for item in fallback:
+                if not isinstance(item, dict):
+                    continue
+                mid = str(item.get("mid") or "").strip()
+                if not mid:
+                    continue
+                if mid in seen:
+                    dup_member = Member(
+                        member_id=mid,
+                        name="（名前不明）",
+                        has_send_button=True,
+                    )
+                    duplicates.append(dup_member)
+                    if debug_on:
+                        self._log_exclusion_immediate(dup_member, "重複")
+                    continue
+                seen.add(mid)
+                history_texts[mid] = str(item.get("history_text") or "")
+                members.append(
+                    Member(
+                        member_id=mid,
+                        name="（名前不明）",
+                        has_send_button=True,
+                    )
+                )
+            if fallback:
+                logger.info(
+                    "【%s】送信ボタン再検出: フォールバック %d 件",
+                    tab_name,
+                    len(fallback),
+                )
+
+        self._debug_collect_duplicates[tab_name] = duplicates
+
+        self._log_pipeline_funnel_stage(tab_name, "Member生成数", len(members))
+        logger.info(
+            "【%s】collect_members完了: DOM解析 %d件 → Member %d件"
+            "（送信ボタンあり %d件）",
+            tab_name,
+            len(raw_cards),
+            len(members),
+            sum(1 for m in members if m.has_send_button),
+        )
+        self._log_collect_count_verification(
+            tab_name,
+            stable_card_count=post_count,
+            dom_count=len(raw_cards),
+            member_count=len(members),
+            parse_mode="スクロール走査マージ",
+        )
+
+        if debug_on:
+            self._log_tab_correlation_stats_debug(page, tab_name, members)
+
+        if not quiet and not self._member_extraction_debug_enabled():
+            logger.info("===== %s =====", tab_name)
+            logger.info("取得カード数: %d", len(members))
+            logger.info(
+                "送信ボタンあり: %d",
+                sum(1 for m in members if m.has_send_button),
+            )
+        return members, history_texts
+
+    def _log_card_parse_stats(
+        self,
+        tab_name: str,
+        stats: dict[str, Any],
+        final_count: int,
+        py_exclusions: dict[str, int],
+    ) -> None:
+        """MEMBER_CARD_PARSE_JS のセレクタ別件数・除外理由を必ず出力."""
+        logger.info("【%s】MEMBER_CARD_PARSE_JS セレクタ別件数", tab_name)
+        selector_hits = stats.get("selectorHits") or {}
+        for sel, count in selector_hits.items():
+            logger.info("  %s = %d", sel, count)
+        logger.info(
+            "  合計(querySelectorAll) = %d",
+            int(stats.get("selectorHitsTotal") or 0),
+        )
+        logger.info("【%s】DOM解析内訳", tab_name)
+        logger.info(
+            "  DOM取得(prune前) %d件",
+            int(stats.get("rawNodesBeforePrune") or 0),
+        )
+        logger.info(
+            "  nested除去 %d件", int(stats.get("nestedPruned") or 0)
+        )
+        logger.info(
+            "  prune後ノード %d件", int(stats.get("nodesAfterPrune") or 0)
+        )
+        logger.info(
+            "  duplicateIdマージ %d件",
+            int(stats.get("duplicateIdMerged") or 0),
+        )
+        logger.info(
+            "  member_idなし %d件", int(stats.get("noMemberId") or 0)
+        )
+        logger.info(
+            "  nameなし %d件", int(stats.get("nameMissing") or 0)
+        )
+        logger.info(
+            "  historyなし %d件", int(stats.get("historyMissing") or 0)
+        )
+        logger.info(
+            "  親要素からID復元 %d件",
+            int(stats.get("recoveredFromParent") or 0),
+        )
+        logger.info(
+            "  スクロール走査 %d回", int(stats.get("scrollPasses") or 0)
+        )
+        logger.info(
+            "  JS uniqueMemberIds %d件",
+            int(stats.get("uniqueMemberIds") or 0),
+        )
+        if py_exclusions:
+            logger.info("【%s】Python DOM解析除外", tab_name)
+            for reason, count in py_exclusions.items():
+                if count:
+                    logger.info("  %s %d件", reason, count)
+        logger.info("  最終 %d件", final_count)
+
+    def _log_member_gen_stats(
+        self,
+        tab_name: str,
+        raw_count: int,
+        gen_stats: dict[str, int],
+        member_count: int,
+    ) -> None:
+        logger.info("【%s】Member生成", tab_name)
+        logger.info("  入力(DOM解析済) %d件", raw_count)
+        excluded = sum(gen_stats.values())
+        if excluded:
+            logger.info("  Member生成失敗")
+            for reason, count in gen_stats.items():
+                if count:
+                    logger.info("    %s %d件", reason, count)
+        logger.info("  最終 %d件", member_count)
+
+    def _card_eval_row_to_dict(
+        self,
+        item: dict[str, Any],
+        tab_name: str,
+        py_exclusions: dict[str, int],
+    ) -> dict[str, Any] | None:
+        mid = str(item.get("mid") or "").strip()
+        uid = str(item.get("uid") or "").strip()
+        member_id = mid or uid
+        name = str(item.get("name") or "（名前不明）")
+        inner_text = str(item.get("cardText") or "")
+        outer_html = str(
+            item.get("cardOuterHtmlHead") or item.get("cardHtmlHead") or ""
+        )[:500]
+        if not member_id:
+            py_exclusions["member_idなし"] = (
+                py_exclusions.get("member_idなし", 0) + 1
+            )
+            if py_exclusions["member_idなし"] <= 5:
+                self._log_locator_correlation_failure(
+                    tab_name,
+                    member_id=mid or uid,
+                    name=name,
+                    inner_text=inner_text,
+                    outer_html=outer_html,
+                )
+            return None
+        return {
+            "member_id": member_id,
+            "name": name,
+            "has_send_button": bool(item.get("hasSendButton")),
+            "history_text": str(item.get("historyText") or "").strip(),
+            "inner_text": inner_text,
+            "outer_html": outer_html,
+        }
+
+    def _rows_to_parsed_cards(
+        self,
+        rows: list[dict[str, Any]],
+        tab_name: str,
+        py_exclusions: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                py_exclusions["不正な型"] = (
+                    py_exclusions.get("不正な型", 0) + 1
+                )
+                continue
+            parsed_item = self._card_eval_row_to_dict(
+                item, tab_name, py_exclusions
+            )
+            if not parsed_item:
+                continue
+            mid = parsed_item["member_id"]
+            existing = merged.get(mid)
+            if not existing or _card_dict_richness(
+                parsed_item
+            ) > _card_dict_richness(existing):
+                merged[mid] = parsed_item
+        return list(merged.values())
+
+    def _evaluate_member_cards(
+        self,
+        surface: Any,
+        tab_name: str,
+        parse_arg: dict[str, str],
+        py_exclusions: dict[str, int],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        raw = surface.evaluate(MEMBER_CARD_PARSE_JS, parse_arg)
+        rows, stats = _extract_card_parse_result(raw)
+        if not rows and raw is not None:
+            if not (
+                isinstance(raw, dict)
+                and isinstance(raw.get("cards"), list)
+                and len(raw["cards"]) == 0
+            ):
+                logger.warning(
+                    "【%s一覧】evaluate 戻り値が不正: type=%s",
+                    tab_name,
+                    type(raw).__name__,
+                )
+        parsed = self._rows_to_parsed_cards(rows, tab_name, py_exclusions)
+        return parsed, stats
+
+    def _scroll_parse_merge_list(
+        self,
+        page: Page,
+        tab_name: str,
+        surface: Any,
+        parse_arg: dict[str, str],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """
+        スクロール → Ajax待ち → DOM解析 → member_idマージ を終了条件まで繰り返す。
+        終了: scrollHeight / カード数 / uniqueMemberIds が連続で変化しないこと。
+        """
+        merged: dict[str, dict[str, Any]] = {}
+        agg_stats: dict[str, Any] = {}
+        py_exclusions: dict[str, int] = {
+            "member_idなし": 0,
+            "不正な型": 0,
+        }
+        expected_total = self._parse_tab_member_total_count(page, tab_name)
+        if expected_total:
+            logger.info(
+                "【%s】現在の%s数: %d件", tab_name, tab_name, expected_total
+            )
+
+        try:
+            page.evaluate("window.scrollTo(0, 0)")
+            self._pause_ms(400)
+        except Exception:
+            pass
+
+        prev_metrics = {
+            "scroll_height": -1,
+            "card_count": -1,
+            "unique_ids": -1,
+        }
+        stable_rounds = 0
+        final_card_count = 0
+        final_scroll_height = 0
+        round_no = 0
+
+        for round_i in range(LIST_SCROLL_PARSE_MAX_ROUNDS):
+            self._check_job_control()
+            round_no = round_i + 1
+
+            try:
+                page.evaluate(
+                    "window.scrollBy(0, Math.min(window.innerHeight * 0.75, 800))"
+                )
+                self._pause_ms(400)
+                self._scroll_list_to_bottom(page)
+            except Exception:
+                pass
+            self._ajax_list_load_wait()
+
+            scroll_height = self._get_list_scroll_height(page)
+            card_count = self._count_member_cards_on_surface(surface)
+
+            try:
+                batch, stats = self._evaluate_member_cards(
+                    surface, tab_name, parse_arg, py_exclusions
+                )
+            except Exception as e:
+                if round_i == 0:
+                    logger.warning(
+                        "【%s一覧】カード解析失敗: %s", tab_name, e
+                    )
+                break
+
+            _merge_parse_stats(agg_stats, stats, scroll_pass=round_no)
+
+            for parsed_item in batch:
+                mid = parsed_item["member_id"]
+                existing = merged.get(mid)
+                if not existing or _card_dict_richness(
+                    parsed_item
+                ) > _card_dict_richness(existing):
+                    merged[mid] = parsed_item
+
+            unique_ids = len(merged)
+            final_card_count = card_count
+            final_scroll_height = scroll_height
+
+            logger.info("スクロール走査 %d回目", round_no)
+            logger.info("  カード数: %d", card_count)
+            logger.info("  uniqueMemberIds: %d", unique_ids)
+            logger.info("  scrollHeight: %d", scroll_height)
+
+            if (
+                scroll_height == prev_metrics["scroll_height"]
+                and card_count == prev_metrics["card_count"]
+                and unique_ids == prev_metrics["unique_ids"]
+            ):
+                stable_rounds += 1
+                if stable_rounds >= LIST_SCROLL_STABLE_ROUNDS:
+                    logger.info(
+                        "【%s】スクロール終了: scrollHeight・カード数・"
+                        "uniqueMemberIds が %d 回連続で変化なし",
+                        tab_name,
+                        LIST_SCROLL_STABLE_ROUNDS,
+                    )
+                    break
+            else:
+                stable_rounds = 0
+
+            prev_metrics = {
+                "scroll_height": scroll_height,
+                "card_count": card_count,
+                "unique_ids": unique_ids,
+            }
+
+            if (
+                expected_total
+                and unique_ids >= expected_total - 3
+                and stable_rounds >= 2
+            ):
+                logger.info(
+                    "【%s】期待件数 %d に到達（取得 %d）",
+                    tab_name,
+                    expected_total,
+                    unique_ids,
+                )
+                break
+        else:
+            logger.warning(
+                "【%s】スクロール走査が上限 %d 回に達しました",
+                tab_name,
+                LIST_SCROLL_PARSE_MAX_ROUNDS,
+            )
+
+        parsed = list(merged.values())
+        logger.info("【%s】最終取得", tab_name)
+        logger.info("  カード数: %d", final_card_count)
+        logger.info("  uniqueMemberIds: %d", len(parsed))
+        logger.info("  scrollHeight: %d", final_scroll_height)
+
+        if expected_total:
+            self._log_list_fetch_vs_expected(
+                tab_name, len(parsed), expected_total
+            )
+
+        agg_stats["scrollPasses"] = round_no
+        self._log_card_parse_stats(
+            tab_name, agg_stats, len(parsed), py_exclusions
+        )
+        self._debug_parse_id_fail_count = py_exclusions.get("member_idなし", 0)
+
+        summary = {
+            "final_card_count": final_card_count,
+            "unique_member_ids": len(parsed),
+            "expected_total": expected_total,
+            "scroll_passes": round_no,
+            "scroll_height": final_scroll_height,
+        }
+        return parsed, summary
 
     def _parse_list_page_cards(
         self, page: Page, tab_name: str
     ) -> list[dict[str, Any]]:
-        """会員一覧ページ上で全カード解析（プロフィールへ遷移しない）."""
-        if self._is_member_profile_page(page):
-            logger.warning(
-                "プロフィールページのため一覧解析をスキップ: %s",
-                page.url,
-            )
-            return []
-
+        """collect_members() 内部専用: スクロール走査マージでカード取得."""
         url = page.url or ""
         if self._cached_list_url == url and self._cached_list_cards is not None:
             return [
                 c for c in self._cached_list_cards if isinstance(c, dict)
             ]
 
-        self._scroll_member_list_to_end(page)
         history_label = self.standard.mitene_history_label
-        step = self._current_step
         surface = self._member_card_surface(page)
+        parse_arg = {"historyLabel": history_label}
 
-        try:
-            raw = surface.evaluate(
-                MEMBER_CARD_PARSE_JS,
-                {"historyLabel": history_label},
-            )
-        except Exception as e:
-            logger.warning("【%s一覧】カード解析失敗: %s", tab_name, e)
-            return []
+        logger.info("【%s】DOM解析: スクロール走査マージ", tab_name)
+        parsed, summary = self._scroll_parse_merge_list(
+            page, tab_name, surface, parse_arg
+        )
+        self._last_list_fetch_summary = summary
 
-        rows = _normalize_evaluate_rows(raw)
-        if not rows and raw is not None:
-            logger.warning(
-                "【%s一覧】evaluate 戻り値が不正: type=%s",
-                tab_name,
-                type(raw).__name__,
-            )
-
-        parsed: list[dict[str, Any]] = []
-        for item in rows:
-            card_text = str(item.get("cardText") or "")
-            history_text = str(item.get("historyText") or "").strip()
-            sent_history = self._card_has_sent_history(card_text, history_text)
-            mid = str(item.get("mid") or "").strip()
-            uid = str(item.get("uid") or "").strip()
-            member_id = mid or uid
-            parsed.append(
-                {
-                    "name": str(item.get("name") or "（名前不明）"),
-                    "uid": uid,
-                    "mid": member_id,
-                    "key": f"comeon-{member_id}" if member_id else "",
-                    "card_text": card_text,
-                    "card_html_head": str(item.get("cardHtmlHead") or ""),
-                    "history_text": history_text,
-                    "match_rate": str(item.get("matchRate") or "").strip(),
-                    "sent_history": sent_history,
-                    "has_send_button": bool(item.get("hasSendButton")),
-                    "is_new": not sent_history,
-                    "has_history_row": sent_history,
-                    "history_date": (
-                        self._parse_history_date(history_text)
-                        or self._parse_history_date(card_text)
-                        if sent_history
-                        else None
-                    ),
-                }
-            )
-
-        self._log_list_cards_debug(parsed, tab_name, step)
-        self._log_tab_parse_summary(parsed, tab_name, step)
         if not parsed:
             self._log_member_card_selector_debug(surface, tab_name)
         self._cached_list_cards = parsed
         self._cached_list_url = url
         return parsed
 
-    def _cards_to_member_queue(
-        self, cards: list[dict[str, Any]]
+    def _filtered_members_to_queue_dicts(
+        self, filtered: list[Member]
     ) -> list[dict[str, Any]]:
-        """解析済みカード → 送信キュー用メンバー dict."""
-        out: list[dict[str, Any]] = []
-        for card in cards:
-            if not isinstance(card, dict):
-                continue
-            key = str(card.get("key") or "")
-            if not key.startswith("comeon-"):
-                continue
+        """filter 済み Member → 送信キュー用 dict."""
+        result: list[dict[str, Any]] = []
+        for member in filtered:
+            key = member_queue_key(member.member_id)
             if key in self._sent_member_keys or key in self._failed_member_keys:
                 continue
-            if not card.get("has_send_button"):
+            if not member.has_send_button:
                 continue
-            out.append(dict(card))
-        return out
+            result.append(
+                {
+                    "key": key,
+                    "mid": member.member_id,
+                    "name": member.name,
+                    "sent_history": member.sent_history,
+                    "has_send_button": member.has_send_button,
+                    "history_date": member.last_sent,
+                }
+            )
+        return result
+
+    def _members_from_fallback_items(
+        self, fallback: list[dict[str, Any]]
+    ) -> tuple[list[Member], dict[str, str]]:
+        members: list[Member] = []
+        history_texts: dict[str, str] = {}
+        for item in fallback:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "")
+            mid = str(item.get("mid") or "").strip()
+            if not mid and key.startswith("comeon-"):
+                mid = key[7:]
+            if not mid:
+                continue
+            history_texts[mid] = str(item.get("history_text") or "")
+            members.append(
+                Member(
+                    member_id=mid,
+                    name="（名前不明）",
+                    has_send_button=bool(item.get("has_send_button", True)),
+                )
+            )
+        return members, history_texts
 
     def _scan_member_cards(self, page: Page) -> list[dict[str, Any]]:
-        """会員カードを走査（一覧DOM・送信済=「送信済」in card_text）."""
+        """送信ループ用: Member 取得 → _apply_step_member_filter → dict キュー."""
+        step = self._current_step
+        members: list[Member] = []
+        history_texts: dict[str, str] = {}
+
         if self._is_member_profile_page(page):
-            return []
-        if self._is_on_comeon_list_page(page):
+            if step and self._is_step_profile_page(page, step):
+                cards = self._parse_profile_tab_members(page, step)
+                members, history_texts = self._raw_cards_to_collected(cards)
+            else:
+                return []
+        elif self._is_on_comeon_list_page(page):
             tab = self._tab_name_from_page(page)
-            cards = self._parse_list_page_cards(page, tab)
-            members = self._cards_to_member_queue(cards)
-            if members:
-                return members
-        return self._scan_send_buttons_fallback(page)
+            members, history_texts = self.collect_members(page, tab, quiet=True)
+        else:
+            fallback = self._scan_send_buttons_fallback(page)
+            members, history_texts = self._members_from_fallback_items(fallback)
+
+        tab_name = (
+            step.tab
+            if step
+            else (
+                self._tab_name_from_page(page)
+                if self._is_on_comeon_list_page(page)
+                else "一覧"
+            )
+        )
+        filter_step = step or PriorityStep(
+            tab=tab_name,
+            member_filter="sendable",
+            list_path=TAB_LIST_PATHS.get(tab_name, ""),
+        )
+        filtered = self._apply_step_member_filter(
+            members, history_texts, filter_step, quiet=True
+        )
+        result = self._filtered_members_to_queue_dicts(filtered)
+        if result:
+            return result
+
+        fallback = self._scan_send_buttons_fallback(page)
+        if not fallback:
+            return []
+        fb_members, fb_histories = self._members_from_fallback_items(fallback)
+        if not fb_members:
+            return []
+        filtered_fb = self._apply_step_member_filter(
+            fb_members, fb_histories, filter_step, quiet=True
+        )
+        return self._filtered_members_to_queue_dicts(filtered_fb)
 
     def _scan_send_buttons_fallback(self, page: Page) -> list[dict[str, Any]]:
         """カード構造で取れないとき registComeon / js-regist_comeon から ID 取得."""
@@ -3402,10 +5414,6 @@ class MiteneSender:
                     "key": key,
                     "mid": str(item.get("mid", key[7:])),
                     "history_text": "",
-                    "has_history_row": False,
-                    "sent_history": False,
-                    "history_date": None,
-                    "is_new": True,
                     "has_send_button": True,
                 }
             )
@@ -3413,133 +5421,143 @@ class MiteneSender:
             logger.info("カード走査フォールバック: %d 人検出", len(result))
         return result
 
-    def _sort_members_oldest_first_keys(
-        self, members: list[dict[str, Any]]
-    ) -> list[str]:
-        """後方互換: 全会員を送信日古い順でキー列にする."""
-        return self._sort_all_members_oldest_first_keys(members)
-
     def _apply_step_member_filter(
-        self, members: list[dict[str, Any]], step: PriorityStep
-    ) -> list[str]:
-        """タブごとの会員条件（未送信のみ / 送信日古い順 / 全員）."""
-        members = [m for m in members if isinstance(m, dict)]
+        self,
+        members: list[Member],
+        history_texts: dict[str, str],
+        step: PriorityStep,
+        *,
+        quiet: bool = False,
+    ) -> list[Member]:
+        """タブごとの会員条件（未送信のみ / 送信日古い順 / 全員）— 送信済判定はここだけ."""
+        enriched = [
+            self._enrich_member_sent_fields(
+                m, history_texts.get(m.member_id, "")
+            )
+            for m in members
+            if m.member_id
+        ]
+        debug_on = self._member_extraction_debug_enabled()
+        log_verbose = not quiet or debug_on
+        duplicates = self._debug_collect_duplicates.pop(step.tab, [])
+
         mode = step.member_filter or "sendable"
         if mode == "new_only":
             filtered = [
-                m for m in members if not m.get("sent_history")
+                m
+                for m in enriched
+                if m.has_send_button
+                and not m.sent_history
+                and member_queue_key(m.member_id)
+                not in self._sent_member_keys
+                and member_queue_key(m.member_id)
+                not in self._failed_member_keys
             ]
-            logger.info(
-                "【%s】新規会員（ミテネ履歴に「送信済」なし）: %d / %d 人",
-                step.tab,
-                len(filtered),
-                len(members),
-            )
-            if not filtered and members:
+            if log_verbose and not debug_on:
+                logger.info(
+                    "【%s】新規会員（ミテネ履歴に「送信済」なし）: %d / %d 人",
+                    step.tab,
+                    len(filtered),
+                    len(enriched),
+                )
+            if not filtered and enriched and log_verbose and not debug_on:
                 logger.info("【%s】未送信会員 0 人", step.tab)
-            return [m["key"] for m in filtered]
-        if mode == "sent_oldest_first":
-            keys = self._sort_all_members_oldest_first_keys(members)
-            logger.info(
-                "【%s】全会員（古い順・同日ランダム）: %d / %d 人",
-                step.tab,
-                len(keys),
-                len(members),
+        elif mode == "sent_oldest_first":
+            pool = [
+                m
+                for m in enriched
+                if m.has_send_button
+                and m.sent_history
+                and member_queue_key(m.member_id)
+                not in self._sent_member_keys
+                and member_queue_key(m.member_id)
+                not in self._failed_member_keys
+            ]
+            filtered = self._sort_members_oldest_first(pool)
+            if log_verbose and not debug_on:
+                logger.info(
+                    "【%s】全会員（古い順・同日ランダム）: %d / %d 人",
+                    step.tab,
+                    len(filtered),
+                    len(enriched),
+                )
+        else:
+            filtered = [
+                m
+                for m in enriched
+                if m.has_send_button
+                and member_queue_key(m.member_id)
+                not in self._sent_member_keys
+                and member_queue_key(m.member_id)
+                not in self._failed_member_keys
+            ]
+
+        self._log_pipeline_funnel_stage(step.tab, "Filter後", len(filtered))
+
+        if debug_on:
+            self._log_filter_exclusions_immediate(
+                enriched, filtered, duplicates, step
             )
-            return keys
-        return [m["key"] for m in members]
-
-    def _merge_member_card(
-        self, merged: dict[str, dict[str, Any]], card: dict[str, Any]
-    ) -> None:
-        """合算キュー用: 同一会員はより古い送信日のカードを優先."""
-        key = str(card.get("key") or "")
-        if not key:
-            return
-        existing = merged.get(key)
-        if not existing:
-            merged[key] = card
-            return
-        d_new = card.get("history_date") or OLDEST_SORT_DEFAULT_DATE  # type: ignore[assignment]
-        d_old = existing.get("history_date") or OLDEST_SORT_DEFAULT_DATE  # type: ignore[assignment]
-        if d_new < d_old:
-            merged[key] = card
-
-    def _send_aggregated_oldest_fallback(
-        self,
-        page: Page,
-        budget: int,
-        sent: int,
-        sent_by_step: dict[str, int],
-        skipped_steps: list[str],
-    ) -> int:
-        """新規0件時: 全タブの会員を合算し送信日古い順にミテネ送信."""
-        label = "全タブ合算（送信日古い順）"
-        if sent >= budget:
-            return sent
-
-        logger.info(
-            "★ 新規会員が全タブに存在しないため %s（gid=%s）",
-            label,
-            self._gid(),
-        )
-        merged: dict[str, dict[str, Any]] = {}
-        for tab_name, list_path in AGGREGATE_LIST_TABS:
-            step = PriorityStep(
-                tab=tab_name,
-                list_path=list_path,
-                member_filter="sendable",
+            if mode == "sent_oldest_first":
+                self._log_oldest_first_sort_debug(step.tab, filtered)
+            self._log_member_extraction_debug(
+                step,
+                members,
+                enriched,
+                filtered,
+                duplicates=duplicates,
             )
-            cards = self._fetch_tab_members(page, step)
-            if not cards:
-                logger.warning("【%s】合算取得をスキップ", tab_name)
-                continue
-            for card in cards:
-                if not isinstance(card, dict) or not card.get("has_send_button"):
-                    continue
-                if card.get("key") in self._sent_member_keys:
-                    continue
-                self._merge_member_card(merged, card)
-
-        keys = self._sort_all_members_oldest_first_keys(list(merged.values()))
-        if not keys:
-            logger.info("合算フォールバック: 送信対象なし")
-            skipped_steps.append(f"{label}（対象なし）")
-            return sent
-
-        logger.info("合算フォールバック: %d 人 → 送信開始", len(keys))
-        return self._send_member_keys_phase(
-            page, label, keys, budget, sent, sent_by_step
-        )
+        elif log_verbose:
+            sent_n = sum(1 for m in enriched if m.sent_history)
+            unsent_n = sum(
+                1 for m in enriched if m.has_send_button and not m.sent_history
+            )
+            logger.info("【%s】送信履歴判定（Member %d件）", step.tab, len(enriched))
+            logger.info("送信済: %d", sent_n)
+            logger.info("未送信: %d", unsent_n)
+            logger.info("Filter後: %d", len(filtered))
+        return filtered
 
     def _count_new_members_on_page(self, page: Page) -> int:
         """未送信会員数（一覧DOM・送信ボタンあり）."""
-        if self._is_on_comeon_list_page(page) and not self._is_member_profile_page(
+        step = self._current_step
+        if not step:
+            return 0
+        new_step = PriorityStep(
+            tab=step.tab,
+            member_filter="new_only",
+            list_path=step.list_path,
+        )
+        if self._is_member_profile_page(page) and self._is_step_profile_page(
+            page, step
+        ):
+            cards = self._parse_profile_tab_members(page, step)
+            members, histories = self._raw_cards_to_collected(cards)
+        elif self._is_on_comeon_list_page(page) and not self._is_member_profile_page(
             page
         ):
             tab = self._tab_name_from_page(page)
-            cards = self._parse_list_page_cards(page, tab)
+            members, histories = self.collect_members(page, tab, quiet=True)
+        else:
+            scanned = self._scan_member_cards(page)
             return sum(
                 1
-                for c in cards
-                if isinstance(c, dict)
-                and not c.get("sent_history")
-                and c.get("has_send_button")
+                for m in scanned
+                if isinstance(m, dict) and not m.get("sent_history")
             )
-        return sum(
-            1
-            for m in _member_dicts_only(self._scan_member_cards(page))
-            if not m.get("sent_history")
+        filtered = self._apply_step_member_filter(
+            members, histories, new_step, quiet=True
         )
+        return len(filtered)
 
     def _scan_unsent_member_keys(self, page: Page) -> list[str]:
         """一覧を走査し、現在ステップ条件に合う会員IDリストを返す."""
-        members = _member_dicts_only(self._scan_member_cards(page))
-        step = self._current_step
-        if step and step.member_filter != "sendable":
-            keys = self._apply_step_member_filter(members, step)
-        else:
-            keys = [m["key"] for m in members if m.get("key")]
+        scanned = self._scan_member_cards(page)
+        keys = [
+            str(m["key"])
+            for m in scanned
+            if isinstance(m, dict) and m.get("key")
+        ]
         if not self.standard.priority_steps:
             keys = self._filter_member_queue(keys)
         return keys
@@ -3674,81 +5692,36 @@ class MiteneSender:
         except Exception:
             return False
 
-    def _send_mitene_to_member(self, page: Page, key: str) -> bool:
-        """会員1人へミテネ送信（クリック → 確認 → 残り回数 or 送信済み表示）."""
-        if not key.startswith("comeon-"):
-            return False
-        member_id = key[7:]
-        wait_ms = max(self._kitene_send_wait_ms(), 6000)
-        remaining_before = self._parse_remaining_count(page)
-        btn = self._kitene_button_locator(page, member_id)
-        try:
-            if self._safe_count(btn) > 0 and self._safe_is_visible(btn.first):
-                btn.first.scroll_into_view_if_needed(timeout=5000)
-                btn.first.click(timeout=10000, force=True)
-            else:
-                page.evaluate(
-                    """(mid) => {
-                        if (typeof registComeon === 'function') registComeon(Number(mid));
-                    }""",
-                    member_id,
-                )
-            page.wait_for_timeout(600)
-            overlay = self._click_overlay_confirm(page)
-            if overlay:
-                logger.debug("確認ポップアップ: %s", overlay)
-            else:
-                self._confirm_send_dialog(page)
-            page.wait_for_timeout(400)
-            self._click_overlay_confirm(page)
+    def _check_job_control(self) -> None:
+        from job_runner import get_current_job_id, wait_if_paused
 
-            remaining_after = self._parse_remaining_count(page)
-            if (
-                remaining_before is not None
-                and remaining_after is not None
-                and remaining_after < remaining_before
-            ):
-                logger.info(
-                    "送信成功 %s（残り %d → %d）",
-                    key,
-                    remaining_before,
-                    remaining_after,
-                )
-                return True
+        wait_if_paused(get_current_job_id())
 
-            if self._wait_kitene_send_result(page, member_id, timeout_ms=wait_ms):
-                return True
+    def _pause_ms(self, ms: int) -> None:
+        from job_runner import interruptible_sleep
 
-            logger.info(
-                "送信未完了 %s（状態: %s・残り %s→%s）",
-                key,
-                self._kitene_member_send_state(page, member_id),
-                remaining_before,
-                remaining_after,
-            )
-        except Exception as e:
-            logger.debug("送信例外 %s: %s", e)
-        return False
+        interruptible_sleep(max(0, ms) / 1000.0)
 
     def _send_mitene_standard(self, page: Page) -> int:
+        if self.dry_run:
+            logger.info("ドライラン: ログイン・残り回数の確認のみ（送信しません）")
+            self._ensure_deco_home(page)
+            remaining = self._parse_remaining_count(page)
+            logger.info(
+                "ドライラン: 残り回数 %s",
+                remaining if remaining is not None else "取得できず",
+            )
+            return 0
+
         logger.info("②ホームでミテネ残り回数を取得")
-        budget = self._read_send_budget(page)
         steps = self.standard.priority_steps or list(DEFAULT_PRIORITY_STEPS)
         skipped_steps: list[str] = []
 
-        if self.dry_run:
-            if steps:
-                for step in steps:
-                    cap = step.max_members if step.max_members > 0 else "残り全部"
-                    logger.info("ドライラン: 【%s】最大%s人", step.tab, cap)
-                    self._open_step_list(page, step)
-            else:
-                self._open_find_members(page)
-            return 0
-
+        budget = self._read_send_budget(page)
         self._sent_member_keys.clear()
         self._failed_member_keys.clear()
         self._send_button_queue.clear()
+        self._reset_debug_run_tracking()
         self._load_member_send_history()
         self._send_target = 0
         self._send_done = 0
@@ -3761,6 +5734,7 @@ class MiteneSender:
 
         if steps:
             self._send_target = budget
+            self._emit_send_progress(0, budget)
             self._log_send_pipeline_info()
             logger.info("送信予算: %d 回（gid=%s）", budget, self._gid())
             sent = self._execute_phased_send_pipeline(
@@ -3775,9 +5749,17 @@ class MiteneSender:
             if list_remaining is not None:
                 logger.info("一覧画面のミテネ残り回数: %d", list_remaining)
                 if list_remaining <= 0:
-                    raise DailyLimitReached("ミテネ残り回数が 0 です。")
-                target = min(target, list_remaining)
+                    if budget > 0:
+                        logger.warning(
+                            "一覧画面の残り回数0を無視（ホームで %d 回取得済み）",
+                            budget,
+                        )
+                    else:
+                        raise DailyLimitReached("ミテネ残り回数が 0 です。")
+                else:
+                    target = min(target, list_remaining)
             self._send_target = target
+            self._emit_send_progress(0, target)
             queue_n = self._refresh_send_button_queue(page)
             if queue_n == 0:
                 raise RuntimeError(
@@ -3790,11 +5772,15 @@ class MiteneSender:
                 target,
                 queue_n,
             )
+            self._begin_send_phase_tracking(
+                "レガシー送信", list(self._send_button_queue)
+            )
             scroll_rounds = 0
             stall = 0
             failed_attempts = 0
             max_failed = min(target + 15, 35)
             while sent < target:
+                self._check_job_control()
                 if failed_attempts >= max_failed:
                     logger.warning(
                         "送信失敗が %d 回に達したため中断（%d/%d 件）",
@@ -3815,6 +5801,7 @@ class MiteneSender:
                     stall = 0
                     continue
                 if not self._send_one_mitene(page):
+                    self._record_send_attempt_from_last()
                     failed_attempts += 1
                     stall += 1
                     if stall >= 5 and scroll_rounds <= self.standard.max_scroll_rounds:
@@ -3822,6 +5809,7 @@ class MiteneSender:
                         self._recover_more_send_buttons(page)
                         stall = 0
                     continue
+                self._record_send_attempt_from_last()
                 # キューが空になったら軽く補充（全62件ログは出さない）
                 if len(self._send_button_queue) < 3:
                     self._refresh_send_button_queue(page, log_scan=False)
@@ -3830,6 +5818,7 @@ class MiteneSender:
                 scroll_rounds = 0
                 sent += 1
                 self._send_done = sent
+                self._emit_send_progress(sent, target)
                 logger.info("1件送信完了（%d / %d）", sent, target)
                 self.human.after_send_pause()
                 try:
@@ -3848,6 +5837,7 @@ class MiteneSender:
                     except Exception as e:
                         if not _is_destroyed_context_error(e):
                             raise
+            self._finish_send_phase_tracking()
 
         note = ""
         if sent < budget:
@@ -3865,6 +5855,8 @@ class MiteneSender:
                     "skipped_steps": skipped_steps,
                     "note": f"{sent} 件送信し、残り回数を使い切りました。",
                 }
+                self._log_run_send_reconciliation()
+                self._log_debug_run_summary()
                 return sent
             note = (
                 f"目標 {budget} 回のうち {sent} 回しか送れませんでした。"
@@ -3873,6 +5865,7 @@ class MiteneSender:
             if self._failed_member_keys:
                 note += f"（送信できなかった会員: {len(self._failed_member_keys)} 人）"
             if self.standard.must_use_full_budget:
+                self._log_run_send_reconciliation()
                 self._last_run_report = {
                     "budget": budget,
                     "sent": sent,
@@ -3902,32 +5895,135 @@ class MiteneSender:
             if count:
                 logger.info("[%s]: %d 件", label, count)
         logger.info("合計 %d 件送信（目標 %d 回）", sent, budget)
+        self._log_run_send_reconciliation()
+        self._log_debug_run_summary()
         return sent
 
-    def _dismiss_optional_popups(self, page: Page) -> None:
-        for label in (
-            "閉じる",
-            "×",
-            "キャンセル",
-            "後で",
-            "OK",
-            "了解",
-            "確認",
-            "とじる",
-        ):
-            loc = page.get_by_text(label, exact=False)
-            if self._safe_count(loc) > 0:
-                try:
-                    loc.first.click(timeout=2000)
-                    page.wait_for_timeout(300)
-                except Exception:
-                    pass
+    _POPUP_DISMISS_LABELS: tuple[str, ...] = (
+        "閉じる",
+        "×",
+        "キャンセル",
+        "後で",
+        "OK",
+        "了解",
+        "確認",
+        "とじる",
+    )
 
-    def _member_key(self, locator: Locator) -> str:
+    def _is_popup_button_locator(self, locator: Locator) -> bool:
+        """button / input[type=button|submit] のみ True."""
         try:
-            return (locator.inner_text(timeout=1500) or "").strip()[:80]
+            return bool(
+                locator.evaluate(
+                    """el => {
+                        const tag = el.tagName.toLowerCase();
+                        if (tag === 'button') return true;
+                        if (tag === 'input') {
+                            const t = (el.getAttribute('type') || '').toLowerCase();
+                            return t === 'button' || t === 'submit';
+                        }
+                        return false;
+                    }"""
+                )
+            )
         except Exception:
-            return f"idx-{id(locator)}"
+            return False
+
+    def _popup_button_locators(self, page: Page, label: str) -> list[Locator]:
+        """ポップアップ用ボタンのみ列挙（曖昧な get_by_text は使わない）."""
+        found: list[Locator] = []
+        seen: set[int] = set()
+
+        def _add(loc: Locator) -> None:
+            n = self._safe_count(loc)
+            for i in range(n):
+                item = loc.nth(i)
+                key = id(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(item)
+
+        _add(page.get_by_role("button", name=label, exact=True))
+        _add(page.locator(f'button:text-is("{label}")'))
+        _add(page.locator(f'input[type="button"][value="{label}"]'))
+        _add(page.locator(f'input[type="submit"][value="{label}"]'))
+        return found
+
+    def _recover_list_after_popup_misclick(self, page: Page) -> bool:
+        """ポップアップ操作でプロフィールへ飛んだ場合、一覧URLへ戻す."""
+        if not self._is_member_profile_page(page):
+            return False
+        logger.warning(
+            "ポップアップクリック失敗: プロフィールへ遷移したため一覧へ戻ります: %s",
+            page.url or "",
+        )
+        step = self._current_step
+        if step:
+            list_url = self._list_url_for_step(page, step)
+            if list_url and self._safe_goto(page, list_url):
+                self._wait_page_settled(page, quick=True)
+                logger.info("一覧へ復帰: %s", page.url or "")
+                return True
+        if self._current_list_path:
+            list_url = self._list_url(page, self._current_list_path)
+            if list_url and self._safe_goto(page, list_url):
+                self._wait_page_settled(page, quick=True)
+                logger.info("一覧へ復帰: %s", page.url or "")
+                return True
+        return False
+
+    def _dismiss_optional_popups(self, page: Page) -> None:
+        """モーダル／ポップアップの閉じるボタンのみクリック（会員カード等は対象外）."""
+        for label in self._POPUP_DISMISS_LABELS:
+            for el in self._popup_button_locators(page, label):
+                if not self._safe_is_visible(el):
+                    continue
+                try:
+                    meta = el.evaluate(
+                        """el => ({
+                            tagName: el.tagName,
+                            className: el.className || '',
+                            outerHTML: (el.outerHTML || '').slice(0, 300),
+                        })"""
+                    )
+                except Exception:
+                    meta = {}
+                logger.warning(
+                    "POPUP_BUTTON_CANDIDATE label=%r url=%s meta=%s",
+                    label,
+                    page.url or "",
+                    meta,
+                )
+                if not self._is_popup_button_locator(el):
+                    logger.warning(
+                        "POPUP_BUTTON_SKIP label=%r: button以外のためクリックしない tag=%s",
+                        label,
+                        (meta or {}).get("tagName", "?"),
+                    )
+                    continue
+                url_before = page.url or ""
+                try:
+                    self._set_nav_debug_action(
+                        f"_dismiss_optional_popups:click:{label}"
+                    )
+                    el.click(timeout=2000)
+                    self._pause_ms(300)
+                except Exception as exc:
+                    logger.warning(
+                        "POPUP_BUTTON_CLICK_FAIL label=%r: %s", label, exc
+                    )
+                    continue
+                url_after = page.url or ""
+                logger.warning(
+                    "POPUP_BUTTON_CLICK_DONE label=%r url_before=%s url_after=%s",
+                    label,
+                    url_before,
+                    url_after,
+                )
+                if self._is_member_profile_page(page):
+                    self._recover_list_after_popup_misclick(page)
+                break
 
     def _looks_like_member_card(self, profile_text: str) -> bool:
         """会員プロフィール（タブバー全体のテキストと区別）."""
@@ -3998,23 +6094,6 @@ class MiteneSender:
             re.search(rf"{re.escape(label)}\s*\n", profile_text)
         )
 
-    def _member_key_from_profile(self, profile_text: str) -> str:
-        for line in profile_text.splitlines():
-            line = line.strip()
-            if not line or line in self.MITENE_ACTION_TEXTS:
-                continue
-            if "さん" in line:
-                return line[:80]
-            if "代・" in line or re.search(r"\d+代", line):
-                return line[:80]
-        return profile_text[:80].replace("\n", " ")
-
-    def _member_keys_match(self, a: str, b: str) -> bool:
-        a, b = a.strip(), b.strip()
-        if not a or not b:
-            return False
-        return a == b or a in b or b in a
-
     def _mitene_send_button_locator(self, page: Page) -> Locator:
         """姫デコ CTA: ♡ミテネを送る / registComeon."""
         return page.locator(
@@ -4025,92 +6104,46 @@ class MiteneSender:
             'button:has-text("ミテネを送る")'
         )
 
-    def _has_mitene_history(self, locator: Locator) -> bool:
-        text = self._locator_profile_text(locator)
-        return self._profile_already_sent_mitene(text)
-
-    def _scroll_member_list_to_end(self, page: Page, *, max_rounds: int = 50) -> int:
-        """一覧を最下部までスクロールし、遅延読込分も DOM に載せる."""
+    def _scroll_member_list_to_end(self, page: Page, *, max_rounds: int = 150) -> int:
+        """一覧を最下部までスクロールし、Ajax 遅延読込分も DOM に載せる."""
         surface = self._member_card_surface(page)
-        prev_count = 0
+        prev = {"scroll_height": -1, "card_count": -1}
         stable = 0
         final_count = 0
         for _ in range(max_rounds):
+            self._check_job_control()
             try:
+                self._scroll_list_to_bottom(page)
+                self._ajax_list_load_wait()
+                scroll_height = self._get_list_scroll_height(page)
                 final_count = self._count_member_cards_on_surface(surface)
-                page.evaluate(
-                    "window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight))"
-                )
-                page.wait_for_timeout(550)
-                if final_count == prev_count:
+                if (
+                    scroll_height == prev["scroll_height"]
+                    and final_count == prev["card_count"]
+                ):
                     stable += 1
-                    if stable >= 3:
+                    if stable >= LIST_SCROLL_STABLE_ROUNDS:
                         break
                 else:
                     stable = 0
-                prev_count = final_count
+                prev = {
+                    "scroll_height": scroll_height,
+                    "card_count": final_count,
+                }
             except Exception:
                 break
-        try:
-            page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(350)
-        except Exception:
-            pass
         logger.info("一覧を最下部までスクロール完了（会員カード %d 件）", final_count)
+        self._log_scroll_metrics_debug(page)
         return final_count
 
     def _scroll_member_list(self, page: Page) -> None:
         for _ in range(2):
+            self._check_job_control()
             try:
                 page.evaluate("window.scrollBy(0, window.innerHeight * 0.55)")
-                page.wait_for_timeout(350)
+                self._pause_ms(350)
             except Exception:
                 break
-
-    def _label_should_skip(self, label: str, active_context: str) -> bool:
-        tab_nav_words = (
-            "マイガール",
-            "キープ",
-            "マッチ率",
-            "口コミ",
-            "みたよ",
-            "ランキング",
-            "ミテネ履歴",
-        )
-        skip_words = (
-            self.standard.find_members_button,
-            "ミテネギフト",
-            "ミテネ残り",
-            "探す",
-            "できる会員",
-        )
-        if any(w in label for w in skip_words):
-            return True
-        if any(w in label for w in tab_nav_words if w not in active_context):
-            return True
-        if label.strip() in tab_nav_words:
-            return True
-        return False
-
-    def _visible_send_button_indices(self, page: Page) -> list[int]:
-        indices: list[int] = []
-        loc = self._mitene_send_button_locator(page)
-        total = self._safe_count(loc)
-        for i in range(total):
-            try:
-                btn = loc.nth(i)
-                if not self._safe_is_visible(btn):
-                    continue
-                if btn.evaluate(
-                    "el => !el.closest('.kitene_send_zumi_btn')"
-                ):
-                    indices.append(i)
-            except Exception as e:
-                if _is_destroyed_context_error(e):
-                    break
-                continue
-
-        return indices
 
     def _mitene_send_succeeded(self, page: Page) -> bool:
         """送信完了トースト／ダイアログ用（一覧全体の「送信済」は見ない）."""
@@ -4126,6 +6159,7 @@ class MiteneSender:
         poll_ms = 120 if self.human.fast_send else 250
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
+            self._check_job_control()
             if member_id:
                 try:
                     done = page.evaluate(
@@ -4153,15 +6187,8 @@ class MiteneSender:
                     pass
             elif self._mitene_send_succeeded(page):
                 return True
-            page.wait_for_timeout(poll_ms)
+            self._pause_ms(poll_ms)
         return False
-
-    def _advance_to_next_member(self, page: Page) -> None:
-        try:
-            page.evaluate("window.scrollBy(0, Math.min(window.innerHeight * 0.55, 380))")
-            page.wait_for_timeout(180 if self.human.fast_send else 500)
-        except Exception:
-            pass
 
     def _send_one_mitene(self, page: Page) -> bool:
         """③ピンク「ミテネを送る」→ 確認ポップアップ → 残り回数が減るまで."""
@@ -4173,21 +6200,70 @@ class MiteneSender:
         else:
             key = self._send_button_queue.pop(0)
         if key in self._sent_member_keys or key in self._failed_member_keys:
+            member_id = self._member_id_from_queue_key(key)
+            self._set_send_attempt_outcome(
+                member_id, "スキップ", "既に送信済または失敗済"
+            )
             return False
         if not key.startswith("comeon-"):
+            self._set_send_attempt_outcome(key, "スキップ", "不正なキューキー")
             return False
         member_id = key[7:]
+        self._last_send_attempt = None
+        debug_send = self._member_extraction_debug_enabled()
+        send_name = self._debug_member_names.get(member_id, "（名前不明）")
+        cta_ok = False
+        modal_shown = False
+        ok_clicked = False
+        remaining_before: int | None = None
+        remaining_after: int | None = None
+        if debug_send:
+            self._log_per_send_debug_header(member_id, send_name)
         try:
+            step = self._current_step
             if self._is_member_profile_page(page):
-                logger.warning(
-                    "送信前にプロフィール検出 — 一覧へ戻してから再試行: %s",
-                    page.url,
-                )
-                step = self._current_step
-                if not step or not self._navigate_to_url_safe(
-                    page, step, force_reload=True
-                ):
-                    return False
+                if step and self._is_step_profile_page(page, step):
+                    if not self._navigate_to_profile_member(
+                        page, member_id, step
+                    ):
+                        logger.warning(
+                            "プロフィール型一覧で会員 %s を表示できません",
+                            key,
+                        )
+                        if debug_send:
+                            self._log_per_send_debug_failure(
+                                cta_ok=cta_ok,
+                                modal_shown=modal_shown,
+                                ok_clicked=ok_clicked,
+                                remaining_before=remaining_before,
+                                remaining_after=remaining_after,
+                                reason="プロフィール表示失敗",
+                            )
+                        self._set_send_attempt_outcome(
+                            member_id, "失敗", "プロフィール表示失敗"
+                        )
+                        return False
+                else:
+                    logger.warning(
+                        "送信前にプロフィール検出 — 一覧へ戻してから再試行: %s",
+                        page.url,
+                    )
+                    if not step or not self._navigate_to_url_safe(
+                        page, step, force_reload=True
+                    ):
+                        if debug_send:
+                            self._log_per_send_debug_failure(
+                                cta_ok=cta_ok,
+                                modal_shown=modal_shown,
+                                ok_clicked=ok_clicked,
+                                remaining_before=remaining_before,
+                                remaining_after=remaining_after,
+                                reason="一覧へ戻れず",
+                            )
+                        self._set_send_attempt_outcome(
+                            member_id, "失敗", "一覧へ戻れず"
+                        )
+                        return False
             remaining_before = self._parse_remaining_count(page)
             btn = self._kitene_button_locator(page, member_id)
             if self._safe_count(btn) == 0 or not self._safe_is_visible(btn.first):
@@ -4202,13 +6278,40 @@ class MiteneSender:
                 len(self._send_button_queue),
             )
             if not self._tap_mitene_cta(page, member_id):
-                return False
-            self.human.action_pause()
-            page.wait_for_timeout(600)
-            self._wait_confirm_layer(page, timeout_ms=4000)
+                self._pause_ms(500)
+                self._dismiss_optional_popups(page)
+                if not self._tap_mitene_cta(page, member_id):
+                    if debug_send:
+                        self._log_per_send_debug_failure(
+                            cta_ok=False,
+                            modal_shown=modal_shown,
+                            ok_clicked=ok_clicked,
+                            remaining_before=remaining_before,
+                            remaining_after=remaining_after,
+                            reason="CTAクリック失敗",
+                        )
+                    btn_after = self._kitene_button_locator(page, member_id)
+                    cta_reason = (
+                        "ボタン消失"
+                        if self._safe_count(btn_after) == 0
+                        else "CTAクリック失敗"
+                    )
+                    self._set_send_attempt_outcome(member_id, "失敗", cta_reason)
+                    return False
+                cta_ok = True
+            else:
+                cta_ok = True
+            if self.human.fast_send:
+                self.human.pause(80, 150)
+            else:
+                self.human.action_pause()
+            self._pause_ms(250 if self.human.fast_send else 600)
+            modal_shown = self._wait_confirm_layer(page, timeout_ms=4000)
+            confirm_wait = 350 if self.human.fast_send else 800
             for _ in range(4):
-                self._confirm_send_dialog(page)
-                page.wait_for_timeout(800)
+                if self._confirm_send_dialog(page):
+                    ok_clicked = True
+                self._pause_ms(confirm_wait)
                 remaining_after = self._parse_remaining_count(page)
                 if (
                     remaining_before is not None
@@ -4221,10 +6324,30 @@ class MiteneSender:
                         remaining_before,
                         remaining_after,
                     )
+                    if debug_send:
+                        self._log_per_send_debug_success(
+                            cta_ok=cta_ok,
+                            modal_shown=modal_shown,
+                            ok_clicked=ok_clicked,
+                            remaining_before=remaining_before,
+                            remaining_after=remaining_after,
+                        )
+                    self._set_send_attempt_outcome(member_id, "成功")
                     self._mark_member_sent(key)
                     self._ensure_member_list_page(page)
                     return True
                 if self._wait_kitene_send_result(page, member_id, timeout_ms=1200):
+                    if debug_send:
+                        if remaining_after is None:
+                            remaining_after = self._parse_remaining_count(page)
+                        self._log_per_send_debug_success(
+                            cta_ok=cta_ok,
+                            modal_shown=modal_shown,
+                            ok_clicked=ok_clicked,
+                            remaining_before=remaining_before,
+                            remaining_after=remaining_after,
+                        )
+                    self._set_send_attempt_outcome(member_id, "成功")
                     self._mark_member_sent(key)
                     self._ensure_member_list_page(page)
                     return True
@@ -4240,39 +6363,73 @@ class MiteneSender:
                     remaining_before,
                     remaining_after,
                 )
+                if debug_send:
+                    self._log_per_send_debug_success(
+                        cta_ok=cta_ok,
+                        modal_shown=modal_shown,
+                        ok_clicked=ok_clicked,
+                        remaining_before=remaining_before,
+                        remaining_after=remaining_after,
+                    )
+                self._set_send_attempt_outcome(member_id, "成功")
                 self._mark_member_sent(key)
                 self._ensure_member_list_page(page)
                 return True
             if self._wait_kitene_send_result(page, member_id, timeout_ms=5000):
+                if debug_send:
+                    if remaining_after is None:
+                        remaining_after = self._parse_remaining_count(page)
+                    self._log_per_send_debug_success(
+                        cta_ok=cta_ok,
+                        modal_shown=modal_shown,
+                        ok_clicked=ok_clicked,
+                        remaining_before=remaining_before,
+                        remaining_after=remaining_after,
+                    )
+                self._set_send_attempt_outcome(member_id, "成功")
                 self._mark_member_sent(key)
                 self._ensure_member_list_page(page)
                 return True
-            self._failed_member_keys.add(key)
+            self._register_failed_member_key(key)
             if len(self._failed_member_keys) <= 2:
                 self._save_debug_screenshot(page, f"send-fail-{member_id}")
+            fail_state = self._kitene_member_send_state(page, member_id)
             logger.info(
                 "送信未完了 %s（状態: %s・残り %s→%s）",
                 key,
-                self._kitene_member_send_state(page, member_id),
+                fail_state,
                 remaining_before,
                 remaining_after,
             )
             logger.info("送信できなかったため次へ (%s)", key)
+            if debug_send:
+                self._log_per_send_debug_failure(
+                    cta_ok=cta_ok,
+                    modal_shown=modal_shown,
+                    ok_clicked=ok_clicked,
+                    remaining_before=remaining_before,
+                    remaining_after=remaining_after,
+                    reason=f"残回数未減少（状態: {fail_state}）",
+                )
+            self._set_send_attempt_outcome(
+                member_id, "失敗", f"残回数未減少（状態: {fail_state}）"
+            )
         except Exception as e:
             if _is_destroyed_context_error(e):
                 self._wait_page_settled(page, quick=True)
                 self._ensure_member_list_page(page)
             logger.debug("タップ失敗: %s", e)
-            self._failed_member_keys.add(key)
-        return False
-
-    def _click_send_on_detail(self, page: Page) -> bool:
-        for text in self.MITENE_ACTION_TEXTS:
-            btn = page.get_by_text(text, exact=False)
-            if self._safe_count(btn) > 0:
-                self.human.human_click(page, btn.first)
-                self._wait_page_settled(page)
-                return self._confirm_send_dialog(page)
+            self._register_failed_member_key(key)
+            if debug_send:
+                self._log_per_send_debug_failure(
+                    cta_ok=cta_ok,
+                    modal_shown=modal_shown,
+                    ok_clicked=ok_clicked,
+                    remaining_before=remaining_before,
+                    remaining_after=remaining_after,
+                    reason=f"例外: {e}",
+                )
+            self._set_send_attempt_outcome(member_id, "失敗", f"例外: {e}")
         return False
 
     def _confirm_send_dialog(self, page: Page) -> bool:

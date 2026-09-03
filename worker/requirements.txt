@@ -1,0 +1,10 @@
+python-dotenv==1.0.1
+PyYAML==6.0.2
+Flask==3.0.3
+APScheduler==3.10.4
+cryptography==43.0.3
+playwright==1.49.1
+upstash-redis==1.2.1
+redis==5.2.1
+gunicorn==23.0.0
+tzdata>=2024.1

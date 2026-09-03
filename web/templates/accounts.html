@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block page_title %}女の子ログイン{% endblock %}
+{% block page_title %}女の子登録情報{% endblock %}
 {% block content %}
 {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
 {% if error %}<div class="flash err">{{ error }}</div>{% endif %}
@@ -58,7 +58,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='account_list.js') }}?v=1"></script>
+<script src="{{ url_for('static', filename='account_list.js') }}?v=5"></script>
 <script>
 window.existingAccountsData = [
   {% for a in accounts %}

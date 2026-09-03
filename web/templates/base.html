@@ -11,29 +11,32 @@
   <link rel="icon" href="{{ url_for('static', filename='icons/deco-app-icon-512.png') }}" type="image/png" sizes="512x512">
   <link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/deco-app-icon-1024.png') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=18">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=31">
 </head>
 <body data-page="{{ request.endpoint or '' }}">
+  <header class="site-header">
+    <h1>姫デコ ミテネ！自動送信</h1>
+    <p class="header-meta">
+      <span class="header-remaining">ミテネ残り回数を全て使い切るまで送信</span>
+    </p>
+  </header>
   <div class="wrap">
-    <header>
-      <h1>姫デコ ミテネ！自動送信</h1>
-      <p class="header-meta">
-        <span class="header-remaining">ミテネ残り回数を全て使い切るまで送信</span>
-      </p>
-    </header>
     <nav class="nav-bar">
       <div class="nav-links">
         <a href="{{ url_for('index') }}" class="{% if request.endpoint == 'index' %}active{% endif %}">設定</a>
-        <a href="{{ url_for('accounts') }}" class="{% if request.endpoint == 'accounts' %}active{% endif %}">女の子ログイン</a>
+        <a href="{{ url_for('accounts') }}" class="{% if request.endpoint == 'accounts' %}active{% endif %}">女の子登録情報</a>
       </div>
       <span id="sync-indicator" class="sync-indicator" title="3分おきに自動で最新状態に更新します"></span>
     </nav>
     {% if storage_warning %}
     <div class="flash warn" role="status">{{ storage_warning }}</div>
     {% endif %}
+    {% if vercel_send_warning %}
+    <div class="flash info" role="status">{{ vercel_send_warning }}</div>
+    {% endif %}
     {% block content %}{% endblock %}
   </div>
-  <script src="{{ url_for('static', filename='sync.js') }}?v=1"></script>
+  <script src="{{ url_for('static', filename='sync.js') }}?v=2"></script>
   {% if mitene_auto_exit %}
   <script src="{{ url_for('static', filename='browser_exit.js') }}?v=2"></script>
   {% endif %}

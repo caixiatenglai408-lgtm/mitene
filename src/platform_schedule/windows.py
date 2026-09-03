@@ -16,7 +16,6 @@ from .common import (
     build_weekly_triggers,
     has_enabled_slots,
     is_frozen_runtime,
-    python_executable,
     scheduled_runner_argv,
 )
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import os
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -35,5 +34,3 @@ def decrypt_secret(value: str) -> str:
         return value
 
 
-def generate_secret_key() -> str:
-    return Fernet.generate_key().decode()

@@ -27,24 +27,35 @@
   <p class="hint">
     自動送信対象 <strong id="enabled-count-hint">{{ enabled_accounts | length }}</strong> 名
     （登録 <span id="accounts-count-hint">{{ accounts|length }}</span> 名）
+    · 全員送信は<strong>本日出勤→お休み</strong>の順
   </p>
-  <div class="cta-row">
-    <button type="button" id="btn-run-all" class="btn-primary">今すぐ全員送信</button>
-    <button type="button" id="btn-dry-all" class="btn-secondary">全員ドライラン（送信しない）</button>
+  <div class="cta-row run-controls">
+    <button type="button" id="btn-run-all" class="btn-primary run-controls__primary">今すぐ全員送信</button>
   </div>
   <div id="run-status" class="run-status" hidden></div>
   <div id="manual-run-result" class="run-result-detail" hidden></div>
 </section>
 
-{% set compact = true %}
-{% include "_account_list.html" with context %}
+<div class="settings-split">
+  {% set compact = true %}
+  <div class="settings-split__left">
+    {% include "_account_list.html" with context %}
+  </div>
+  <div class="settings-split__right">
+    {% include "_attendance_panel.html" with context %}
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>document.body.dataset.accountListCompact = "1";</script>
 <script src="{{ url_for('static', filename='run_results.js') }}?v=1"></script>
-<script src="{{ url_for('static', filename='run_ui.js') }}?v=1"></script>
-<script src="{{ url_for('static', filename='account_list.js') }}?v=2"></script>
+<script src="{{ url_for('static', filename='run_poll.js') }}?v=34"></script>
+<script src="{{ url_for('static', filename='run_progress.js') }}?v=34"></script>
+<script src="{{ url_for('static', filename='run_ui.js') }}?v=36"></script>
+<script src="{{ url_for('static', filename='attendance.js') }}?v=3"></script>
+<script src="{{ url_for('static', filename='account_list.js') }}?v=34"></script>
+<script src="{{ url_for('static', filename='sync.js') }}?v=3"></script>
 <script>
 async function postJson(url, body) {
   window.MiteneSync?.pause(6000);
@@ -60,120 +71,132 @@ async function postJson(url, body) {
   return data;
 }
 
-function setAutomation(enabled) {
-  postJson("/api/automation", { enabled }).then((data) => {
-    const badge = document.getElementById("automation-badge");
-    const onBtn = document.getElementById("btn-automation-on");
-    const offBtn = document.getElementById("btn-automation-off");
-    if (data.automation_enabled) {
-      badge.textContent = "ON";
-      badge.className = "status-badge on";
-      onBtn.classList.add("active");
-      offBtn.classList.remove("active");
-    } else {
-      badge.textContent = "OFF";
-      badge.className = "status-badge off";
-      offBtn.classList.add("active");
-      onBtn.classList.remove("active");
-    }
-  }).catch((e) => alert(e.message));
+function setAutomation(enabled, e) {
+  if (e) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+  fetch("/api/automation", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: !!enabled }),
+  })
+    .then((res) => res.json().then((data) => ({ res, data })))
+    .then(({ res, data }) => {
+      if (!res.ok) {
+        throw new Error(data.error || `エラー (${res.status})`);
+      }
+      const badge = document.getElementById("automation-badge");
+      const onBtn = document.getElementById("btn-automation-on");
+      const offBtn = document.getElementById("btn-automation-off");
+      if (data.automation_enabled) {
+        badge.textContent = "ON";
+        badge.className = "status-badge on";
+        onBtn.classList.add("active");
+        offBtn.classList.remove("active");
+      } else {
+        badge.textContent = "OFF";
+        badge.className = "status-badge off";
+        offBtn.classList.add("active");
+        onBtn.classList.remove("active");
+      }
+    })
+    .catch((err) => alert(err.message || "設定の保存に失敗しました"));
 }
 
-document.getElementById("btn-automation-on").onclick = () => setAutomation(true);
-document.getElementById("btn-automation-off").onclick = () => setAutomation(false);
+document.getElementById("btn-automation-on").onclick = (e) => setAutomation(true, e);
+document.getElementById("btn-automation-off").onclick = (e) => setAutomation(false, e);
 
 function renderManualRunDisplay(display) {
   window.MiteneRunUI?.renderManualResult(display, "手動実行の結果");
 }
 
-async function pollJob(jobId) {
-  const res = await fetch(`/api/jobs/${jobId}`);
-  const data = await res.json();
-  if (!data.ok) throw new Error(data.error || "ジョブ取得失敗");
-  return data.job;
-}
-
-async function runAll(dryRun) {
+async function runBatch(group) {
   const ui = window.MiteneRunUI;
-  const label = dryRun ? "全員ドライラン" : "今すぐ全員送信";
-  const n = document.getElementById("enabled-count-hint")?.textContent?.trim() || "?";
-  if (!dryRun && !confirm(
-    `${label}を開始しますか？\n\n・自動送信対象の女の子 ${n} 名を順番に処理\n・1人あたり「ミテネ残り回数」ぶん、全て使い切るまで送信\n・10日以内に送った会員は除外（候補不足時は除く）\n・対象外にした女の子はスキップ`
+  const poll = window.MiteneRunPoll;
+  if (ui?.isJobRunning?.()) {
+    alert("すでに実行中です。完了を待ってから再度お試しください。");
+    return;
+  }
+  const labels = {
+    all: "今すぐ全員送信",
+    working: "本日出勤の女の子を送信",
+    off: "お休みの女の子を送信",
+  };
+  const label = labels[group] || labels.all;
+  const countHints = {
+    all: document.getElementById("enabled-count-hint")?.textContent?.trim() || "?",
+    working: document.getElementById("working-count-hint")?.textContent?.trim() || "0",
+    off: document.getElementById("off-count-hint")?.textContent?.trim() || "0",
+  };
+  const n = countHints[group] || countHints.all;
+  if (!confirm(
+    group === "all"
+      ? `${label}を開始しますか？\n\n・自動送信対象 ${n} 名（本日出勤→お休みの順）\n・1人あたり「ミテネ残り回数」ぶん送信`
+      : `${label}を開始しますか？\n\n・対象 ${n} 名`
   )) {
     return;
   }
 
   ui?.clearManualResult();
-  let stopElapsed = ui?.createElapsedTicker((sec) => {
-    ui.setRunStatus({
-      running: true,
-      message: dryRun ? "ドライラン実行中…" : "全員送信中…",
-      elapsedSec: sec,
-    });
-  });
 
   try {
-    const url = dryRun ? "/api/run-dry-all" : "/api/run-now";
-    const start = await postJson(url, { manual: true });
+    const start = await postJson("/api/run-now", { manual: true, group });
     const jobId = start.job_id;
-    const startedAt = Date.now();
-    const maxWaitMs = 22 * 60 * 1000;
+    const runningLabel =
+      group === "working"
+        ? "出勤送信中…"
+        : group === "off"
+          ? "お休み送信中…"
+          : "全員送信中…";
+    ui?.setActiveJob?.(jobId);
+    ui?.setRunStatus?.({
+      running: true,
+      message: runningLabel,
+      elapsedSec: 0,
+    });
 
-    const timer = setInterval(async () => {
-      try {
-        const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-        const job = await pollJob(jobId);
-
-        if (job.status === "running") {
-          ui?.setRunStatus({
-            running: true,
-            message: dryRun ? "ドライラン実行中…" : "全員送信中…",
-            elapsedSec: elapsed,
-          });
-          if (Date.now() - startedAt > maxWaitMs) {
-            clearInterval(timer);
-            stopElapsed?.();
-            ui?.setRunStatus({
-              running: false,
-              isError: true,
-              message: "応答がありません。起動.command を再起動してログを確認してください。",
-            });
-          }
-          return;
+    poll?.watchJob(jobId, {
+      dryRun: false,
+      runningLabel,
+      group,
+      onProgress(job) {
+        window.MiteneRunProgress?.apply(job);
+        window.MiteneRunProgress?.applyAccountRows?.(job);
+        const partial = job.partial_display;
+        if (partial && (partial.completed?.length || partial.errors?.length)) {
+          window.MiteneRunResults?.render(
+            partial,
+            document.getElementById("manual-run-result")
+          );
         }
-
-        clearInterval(timer);
-        stopElapsed?.();
-
-        if (job.status === "done") {
-          const display = job.display || null;
-          const hasIssues = display ? !!display.has_issues : false;
-          ui?.setRunStatus({
-            running: false,
-            phase: "done",
-            isError: hasIssues,
-            message: job.message || "処理が終わりました",
-          });
-          if (display) renderManualRunDisplay(display);
-        } else if (job.status === "error") {
-          ui?.setRunStatus({
-            running: false,
-            isError: true,
-            message: job.error || "送信に失敗しました",
-          });
-        }
-      } catch (e) {
-        clearInterval(timer);
-        stopElapsed?.();
+      },
+      onStatus(opts) {
+        const baseMsg = opts.message || runningLabel;
+        ui?.setRunStatus({
+          ...opts,
+          message:
+            opts.reconnecting && !(baseMsg || "").includes("通信復帰待ち")
+              ? `${baseMsg}（通信復帰待ち）`
+              : baseMsg,
+          elapsedSec: opts.elapsedSec,
+        });
+      },
+      onDone(job) {
+        ui?.finalizeJob?.(job, label + "の結果");
+      },
+      onError(message) {
+        ui?.clearActiveJob?.();
+        window.MiteneRunProgress?.clear?.();
         ui?.setRunStatus({
           running: false,
           isError: true,
-          message: e.message,
+          message,
         });
-      }
-    }, 2000);
+      },
+    });
   } catch (e) {
-    stopElapsed?.();
+    ui?.clearActiveJob?.();
     ui?.setRunStatus({
       running: false,
       isError: true,
@@ -182,7 +205,8 @@ async function runAll(dryRun) {
   }
 }
 
-document.getElementById("btn-run-all").onclick = () => runAll(false);
-document.getElementById("btn-dry-all").onclick = () => runAll(true);
+document.getElementById("btn-run-all").onclick = () => runBatch("all");
+document.getElementById("btn-run-working").onclick = () => runBatch("working");
+document.getElementById("btn-run-off").onclick = () => runBatch("off");
 </script>
 {% endblock %}

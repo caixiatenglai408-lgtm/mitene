@@ -32,10 +32,15 @@ class HumanBehavior:
 
     def pause(self, min_ms: int, max_ms: int) -> None:
         if not self.enabled:
-            time.sleep(min_ms / 1000)
-            return
-        delay = random.randint(min_ms, max_ms) / 1000
-        time.sleep(delay)
+            delay = min_ms / 1000
+        else:
+            delay = random.randint(min_ms, max_ms) / 1000
+        try:
+            from job_runner import interruptible_sleep
+
+            interruptible_sleep(delay)
+        except ImportError:
+            time.sleep(delay)
 
     def action_pause(self) -> None:
         self.pause(*self.action_delay_ms)
@@ -63,40 +68,9 @@ class HumanBehavior:
 
     def after_send_pause(self) -> None:
         if self.fast_send:
-            self.pause(60, 150)
+            self.pause(30, 80)
             return
         self.pause(*self.after_send_delay_ms)
-
-    def send_click(self, page: Page, locator: Locator) -> None:
-        """ミテネ送信ボタン用（fast_send 時は待ち少なめの直接クリック）."""
-        if self.fast_send:
-            self.pause(80, 200)
-            try:
-                locator.scroll_into_view_if_needed(timeout=4000)
-            except Exception:
-                pass
-            locator.click(timeout=12000)
-            return
-        self.human_click(page, locator)
-
-    def maybe_idle_pause(self) -> None:
-        if not self.enabled or random.random() > self.idle_pause_probability:
-            return
-        self.pause(*self.idle_pause_ms)
-        logger.debug("一覧を眺める待機")
-
-    def human_type(self, locator: Locator, text: str) -> None:
-        locator.click()
-        self.pause(200, 600)
-        if not self.enabled:
-            locator.fill(text)
-            return
-        try:
-            locator.fill("")
-        except Exception:
-            pass
-        delay = random.randint(*self.typing_delay_ms)
-        locator.press_sequentially(text, delay=delay)
 
     def human_click(self, page: Page, locator: Locator) -> None:
         self.action_pause()
