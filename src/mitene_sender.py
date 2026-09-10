@@ -18,7 +18,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from human_behavior import HumanBehavior
-from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwright, sync_playwright
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Locator,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -505,6 +513,10 @@ MEMBER_CARD_PARSE_JS = (
             historyText: readHistory(card),
             matchRate: readMatchRate(card),
             hasSendButton: hasSendButton(card),
+            hasQuestionBox: !!(
+                card.querySelector('.kitene_question')
+                || card.querySelector('.kitene_question_box')
+            ),
         };
     };
     const selectorInfo = countSelectorHits();
@@ -752,6 +764,20 @@ MATCH_LIST_STABLE_POLLS = 2            # loading 消失後、card 数がこの p
 MATCH_AJAX_NO_MORE_MS = 2500           # マッチ率のみ _ajax_list_load_wait の「増加なし完了」判定を延長（既定 LIST_AJAX_NO_MORE_MS=1200）
 MATCH_MIN_STABLE_CARDS = 1             # ⑤収集がこれ以下 ＋ MATCH_LOAD_TIMEOUT のとき 1 回だけ再確認
 
+# ── STEP 9.6: マッチ率「当日 recommend」再生成（MATCH_RECOMMEND_REFRESH）──
+#   CityHeaven はマッチ率一覧を localStorage の COME-ON-RECOMMEND-DATA_<gid> /
+#   COME-ON-RECOMMEND-SCORE_<gid> から描画する（comeon_matching.js）。storage_state に
+#   前日の DATA が凍結されると、automation は毎 run その古い 100 人（全員送信済み）を
+#   読み続ける。→ run 毎に当該キャッシュを消して「storage 無し」正常ルートを通し、
+#   www.cityheaven.net/.../heaven-ai/comeon-recommend/ から当日リストを再生成させる。
+#   再生成に失敗したら stale を candidate にしない（④⑤ SKIP）。
+MATCH_RECOMMEND_LS_PREFIXES = (
+    "COME-ON-RECOMMEND-DATA_",
+    "COME-ON-RECOMMEND-SCORE_",
+)
+MATCH_RECOMMEND_RESPONSE_SUBSTR = "heaven-ai/comeon-recommend"
+MATCH_RECOMMEND_REFRESH_WAIT_MS = 20000  # comeon_matching.js の AJAX_WAIT_TIME=15000 + 余裕
+
 
 LIST_LOADING_GONE_JS = """
 () => {
@@ -986,6 +1012,27 @@ def _extract_card_parse_result(
     return _normalize_evaluate_rows(raw), {}
 
 
+def _strip_match_recommend_ls(state: dict[str, Any]) -> dict[str, Any]:
+    """storage_state dict から COME-ON-RECOMMEND-* の localStorage 項目だけ除去する.
+
+    cookie / その他 origin / その他 localStorage キーは一切変更しない（STEP 9.6 §7）。
+    前日のマッチ率 recommend キャッシュを翌 run へ凍結復元しないための保存時フィルタ。
+    """
+    try:
+        for origin in state.get("origins", []) or []:
+            ls = origin.get("localStorage")
+            if not isinstance(ls, list):
+                continue
+            origin["localStorage"] = [
+                kv
+                for kv in ls
+                if not str(kv.get("name", "")).startswith(MATCH_RECOMMEND_LS_PREFIXES)
+            ]
+    except Exception:  # noqa: BLE001 - 保存フィルタ失敗で保存自体は止めない
+        pass
+    return state
+
+
 def _card_dict_richness(card: dict[str, Any]) -> int:
     score = len(str(card.get("history_text") or "")) * 10
     score += len(str(card.get("name") or ""))
@@ -1077,6 +1124,9 @@ class MiteneSender:
         # STEP 4: 当日すでに member_sends.jsonl に成功記録がある会員キー（cooldown とは独立の hard guard）
         self._sent_today_keys: set[str] = set()
         self._member_last_sent: dict[str, date] = {}
+        # STEP 9.6: マッチ率「当日 recommend」再生成の状態（run/account ごとに 1 回だけ）
+        self._match_recommend_attempted: bool = False
+        self._match_recommend_ok: bool = False
         # STEP 4: 1 invocation の一意 ID（retry は同じ ID を使い回す）
         self._run_id: str = ""
         # STEP 4: reconciliation 用の残回数観測（[{"at": str, "value": int|None, "date": str}]）
@@ -1922,8 +1972,9 @@ class MiteneSender:
                         if not self.dry_run and sent > 0:
                             self._record_sent(count=sent, flow="standard")
                     if self.auth_state_path:
-                        self.auth_state_path.parent.mkdir(parents=True, exist_ok=True)
-                        context.storage_state(path=str(self.auth_state_path))
+                        # STEP 9.6: 保存前に COME-ON-RECOMMEND-* だけ除外（前日 recommend を
+                        # 翌 run へ凍結しない）。失敗は従来どおり呼び出し側へ伝播。
+                        self._write_storage_state_filtered(context)
                     context.close()
                     break
                 except Exception as e:
@@ -2047,8 +2098,7 @@ class MiteneSender:
         if not self.auth_state_path:
             return False
         try:
-            self.auth_state_path.parent.mkdir(parents=True, exist_ok=True)
-            context.storage_state(path=str(self.auth_state_path))
+            self._write_storage_state_filtered(context)
             logger.debug(
                 "storage_state を保存しました (%s): %s",
                 when,
@@ -2060,6 +2110,20 @@ class MiteneSender:
                 "storage_state の保存に失敗しました (%s、処理は継続): %s", when, e
             )
             return False
+
+    def _write_storage_state_filtered(self, context: BrowserContext) -> None:
+        """context.storage_state() を dict で取得 → COME-ON-RECOMMEND-* を除外 → JSON 保存.
+
+        STEP 9.6 §7/§8: path 直書きではなく dict 経由で部分書き込み失敗リスクを下げ、
+        マッチ率 recommend キャッシュ（DATA/SCORE）だけを永続 storage_state から外す。
+        cookie / auth / その他 localStorage は不変。保存失敗は呼び出し側へ伝播。
+        """
+        self.auth_state_path.parent.mkdir(parents=True, exist_ok=True)
+        state = context.storage_state()
+        _strip_match_recommend_ls(state)
+        self.auth_state_path.write_text(
+            json.dumps(state, ensure_ascii=False), encoding="utf-8"
+        )
 
     def _launch(self, p: Playwright) -> Browser:
         ws_endpoint = (os.getenv("PLAYWRIGHT_BROWSER_WS_ENDPOINT") or "").strip()
@@ -3486,6 +3550,16 @@ class MiteneSender:
             return _perf_emit(([], {}))
 
         pre_count = self._prepare_list_page_before_collect(page, step.tab)
+        if (
+            step.tab == "マッチ率"
+            and self._last_list_render_status == "match_recommend_unavailable"
+        ):
+            # STEP 9.6 fail-safe: 当日 Match 一覧が取れない → stale を parse しない。
+            logger.error(
+                "【%s】MATCH_TODAY_DATA_UNAVAILABLE → 収集中止（stale 一覧を使わない）",
+                step.tab,
+            )
+            return _perf_emit(([], {}))
         self._log_list_page_before_parse(
             page, step.tab, pre_count, step=step
         )
@@ -4015,6 +4089,17 @@ class MiteneSender:
         except Exception:
             pass
         _is_match = step.tab == "マッチ率"
+        if (
+            _is_match
+            and self._match_recommend_attempted
+            and not self._match_recommend_ok
+        ):
+            # STEP 9.6 fail-safe: 当日 Match 一覧が取れない → stale 100人では送らない。
+            logger.error(
+                "【%s】MATCH_TODAY_DATA_UNAVAILABLE → ④ SKIP（stale 一覧で送信しない）",
+                label,
+            )
+            return sent
         if _is_match and self._last_list_render_status == "match_load_timeout":
             logger.warning(
                 "【%s】マッチ率候補が MATCH_LOAD_TIMEOUT。"
@@ -4164,6 +4249,11 @@ class MiteneSender:
         gid = self._gid()
         logger.info("=== 新規会員優先巡回（gid=%s）===", gid)
 
+        # STEP 9.6: この 5 フェーズ巡回に入るたび、マッチ率「当日 recommend」再生成の
+        # 状態をリセット（run/account ごとに 1 回だけ実行されるようにする）。
+        self._match_recommend_attempted = False
+        self._match_recommend_ok = False
+
         # budget が既に満了しているなら navigation / crawl を一切開始しない
         if sent >= budget:
             return sent
@@ -4201,6 +4291,17 @@ class MiteneSender:
         self._check_account_timeout()
         self._current_phase = "⑤マッチ率（古い順）"
         self._mark_progress("phase:⑤マッチ率（古い順）")
+        if self._match_recommend_attempted and not self._match_recommend_ok:
+            # STEP 9.6 fail-safe: ④ と同じ当日データ不可 → ⑤ も stale では送らない。
+            logger.error(
+                "【⑤マッチ率（古い順）】MATCH_TODAY_DATA_UNAVAILABLE → ⑤ SKIP"
+                "（stale 一覧で送信しない）"
+            )
+            skipped_steps.append("⑤マッチ率(古い順): MATCH_TODAY_DATA_UNAVAILABLE")
+            logger.info(
+                "本日の送信巡回ルート完了（送信 %d / 目標 %d）", sent, budget
+            )
+            return sent
         step5 = PriorityStep(
             tab="マッチ率",
             member_filter="sent_oldest_first",
@@ -5880,11 +5981,127 @@ class MiteneSender:
         logger.info("【%s】一覧準備開始", tab_name)
         self._ensure_list_from_profile(page, tab_name)
         if tab_name == "マッチ率":
+            # STEP 9.6: この run で初めてマッチ率一覧を使う直前に、当日 recommend を再生成。
+            self._maybe_refresh_match_recommend(page)
+            if self._match_recommend_attempted and not self._match_recommend_ok:
+                self._last_list_render_status = "match_recommend_unavailable"
+                logger.error(
+                    "【マッチ率】MATCH_TODAY_DATA_UNAVAILABLE / "
+                    "MATCH_RECOMMEND_REFRESH_FAILED — 当日Match一覧を取得できないため "
+                    "candidate 収集を行わない（stale 100人を使わない・④⑤ SKIP）"
+                )
+                return 0
             card_n, _ok = self._wait_match_list_ready(page, tab_name)
         else:
             card_n, ready = self._poll_wait_for_list_render(page, tab_name)
             self._last_list_render_status = "ready" if ready else "timeout"
         return card_n
+
+    def _maybe_refresh_match_recommend(self, page: Page) -> None:
+        """マッチ率「当日 recommend」再生成を run/account ごとに 1 回だけ実行（STEP 9.6 §5）."""
+        if self._match_recommend_attempted:
+            return
+        self._match_recommend_attempted = True
+        try:
+            self._match_recommend_ok = self._refresh_match_recommend_once(page)
+        except Exception as e:  # noqa: BLE001 - 失敗は fail-safe（④⑤ SKIP）で吸収
+            logger.error("マッチ率当日refresh: 想定外の例外 → 当日データ不可扱い: %s", e)
+            self._match_recommend_ok = False
+
+    def _refresh_match_recommend_once(self, page: Page) -> bool:
+        """localStorage の COME-ON-RECOMMEND-DATA/SCORE_<gid> を削除して一覧をリロードし、
+        comeon_matching.js の「storage 無し」正常ルート
+        （→ www.cityheaven.net/.../heaven-ai/comeon-recommend/ POST → 当日 DATA setStorage
+        → renderRecommendList）を通す。当日 DATA を検証できたら True。
+
+        送信系（J10AjaxComeon / registComeon）は一切呼ばない。REAL SEND 0。
+        """
+        gid = (self._gid() or "").strip()
+        if not gid:
+            logger.error("マッチ率当日refresh: gid 不明 → 当日データ不可扱い")
+            return False
+        url = build_list_url(gid, "/J10ComeonAiMatchingList.php")
+        if not url:
+            logger.error("マッチ率当日refresh: 一覧URL生成失敗 → 当日データ不可扱い")
+            return False
+        keys = [p + gid for p in MATCH_RECOMMEND_LS_PREFIXES]
+        try:
+            if "cityheaven.net" not in (page.url or ""):
+                page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=self.browser_cfg.timeout_ms,
+                )
+            page.evaluate(
+                "(ks) => { for (const k of ks) { try { localStorage.removeItem(k); } "
+                "catch (e) {} } }",
+                keys,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("マッチ率当日refresh: stale cache 削除に失敗 → 当日データ不可: %s", e)
+            return False
+
+        # storage 無しルートを通すためリロード。当日 recommend 生成 POST の 200 応答を待つ。
+        try:
+            with page.expect_response(
+                lambda r: MATCH_RECOMMEND_RESPONSE_SUBSTR in r.url and r.status == 200,
+                timeout=MATCH_RECOMMEND_REFRESH_WAIT_MS,
+            ):
+                page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=self.browser_cfg.timeout_ms,
+                )
+        except PlaywrightTimeoutError:
+            logger.error(
+                "マッチ率当日refresh: comeon-recommend の 200 応答が %d ms 以内に来ない "
+                "→ 当日データ不可（stale 不使用・④⑤ SKIP）",
+                MATCH_RECOMMEND_REFRESH_WAIT_MS,
+            )
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.error("マッチ率当日refresh: リロード/応答待ちで例外 → 当日データ不可: %s", e)
+            return False
+
+        # 当日カードの描画完了を待つ（既存 ready 判定を流用）。
+        try:
+            self._wait_match_list_ready(page, "マッチ率")
+        except Exception:  # noqa: BLE001 - ここでの待機失敗は下の DATA 検証で最終判定
+            pass
+
+        # 当日 DATA 検証: 存在 / recommend_list>0 / expire が現在時刻以降（STEP 9.6 §9）。
+        try:
+            meta = page.evaluate(
+                "(k) => { const v = localStorage.getItem(k); if (!v) return null; "
+                "try { const o = JSON.parse(v); "
+                "return { n: (o.recommend_list || []).length, expire: o.expire || 0 }; } "
+                "catch (e) { return null; } }",
+                MATCH_RECOMMEND_LS_PREFIXES[0] + gid,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("マッチ率当日refresh: 当日 DATA 検証で例外 → 当日データ不可: %s", e)
+            return False
+
+        now_epoch = int(time.time())
+        if not isinstance(meta, dict) or int(meta.get("n") or 0) <= 0:
+            logger.error(
+                "マッチ率当日refresh: 当日 DATA が空/不在 → 当日データ不可（stale 不使用）"
+            )
+            return False
+        if int(meta.get("expire") or 0) < now_epoch:
+            logger.error(
+                "マッチ率当日refresh: 当日 DATA が expire 済み（expire=%s / now=%s）"
+                " → 当日データ不可（stale 不使用）",
+                meta.get("expire"),
+                now_epoch,
+            )
+            return False
+        logger.info(
+            "マッチ率当日refresh 成功: recommend_list %d 件・expire=%s（当日一覧を採用）",
+            int(meta["n"]),
+            meta.get("expire"),
+        )
+        return True
 
     def _log_pipeline_funnel_stage(
         self,
@@ -5977,6 +6194,16 @@ class MiteneSender:
             )
         else:
             pre_count = self._prepare_list_page_before_collect(page, tab_name)
+            if (
+                tab_name == "マッチ率"
+                and self._last_list_render_status == "match_recommend_unavailable"
+            ):
+                # STEP 9.6 fail-safe: 当日 Match 一覧不可 → stale を parse しない。
+                logger.error(
+                    "【%s】MATCH_TODAY_DATA_UNAVAILABLE → 収集中止（stale 一覧を使わない）",
+                    tab_name,
+                )
+                return [], {}
             if (
                 step
                 and step.tab == tab_name
@@ -6286,6 +6513,14 @@ class MiteneSender:
                     inner_text=inner_text,
                     outer_html=outer_html,
                 )
+            return None
+        if tab_name == "マッチ率" and not bool(item.get("hasQuestionBox")):
+            # STEP 9.6: マッチ率だけ、.kitene_question を持たない CTA 単体 node
+            # （phantom: 送信ボタン div だけが会員カードとして拾われる）を候補から除外。
+            # ①②③ の DOM parser には影響しない（tab_name ガード）。
+            py_exclusions["マッチ率_質問枠なし"] = (
+                py_exclusions.get("マッチ率_質問枠なし", 0) + 1
+            )
             return None
         return {
             "member_id": member_id,
