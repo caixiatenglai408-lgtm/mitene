@@ -1127,6 +1127,9 @@ class MiteneSender:
         # STEP 9.6: マッチ率「当日 recommend」再生成の状態（run/account ごとに 1 回だけ）
         self._match_recommend_attempted: bool = False
         self._match_recommend_ok: bool = False
+        # STEP 12: ①〜⑤ multi-pass ループの記録（レポート用・制御には budget/進捗を使う）
+        self._multi_pass_count: int = 0
+        self._multi_pass_stop_reason: str = ""
         # STEP 4: 1 invocation の一意 ID（retry は同じ ID を使い回す）
         self._run_id: str = ""
         # STEP 4: reconciliation 用の残回数観測（[{"at": str, "value": int|None, "date": str}]）
@@ -4342,6 +4345,83 @@ class MiteneSender:
     RANDOM_CONSUME_EXTRA_ATTEMPTS = 5
     RANDOM_CONSUME_MAX_ATTEMPTS = 20
 
+    # STEP 12: 1 巡で残回数を使い切れなかった場合に ①〜⑤ を回し直す上限（無限ループ防止）。
+    MULTI_PASS_MAX = 6
+
+    def _execute_phased_send_loop(
+        self,
+        page: Page,
+        budget: int,
+        sent: int,
+        sent_by_step: dict[str, int],
+        skipped_steps: list[str],
+    ) -> int:
+        """①〜⑤ を 1 巡し、残回数が残っていれば当日一覧を取り直して再度①〜⑤を回す。
+
+        - total_sent は locked budget（＝開始時残回数の cap 値）を絶対に超えない。
+          残回数の再取得値は「継続するかどうか」の判定にのみ使い、budget は上げない（§9）。
+        - 各 pipeline 呼び出しは先頭で Match refresh 状態をリセットするため、2 巡目以降も
+          stale な当日一覧を使わない（既存 STEP 9.6 の挙動をそのまま利用・§3）。
+        - same-day hard guard / member_sends / run 内 duplicate 防止は据え置き。1 巡目で
+          送った会員は 2 巡目で自動 SKIP される（§4）。
+        - 停止条件（いずれも正常終了扱い・ERROR にしない・§6）:
+          budget 到達 / 残回数 0 / その巡で 0 件送信（進捗なし）/ 上限 MULTI_PASS_MAX 巡。
+        """
+        self._multi_pass_count = 0
+        self._multi_pass_stop_reason = ""
+        for _pass in range(1, self.MULTI_PASS_MAX + 1):
+            if sent >= budget:
+                self._multi_pass_stop_reason = "budget_reached"
+                break
+            self._check_job_control()
+            self._check_account_timeout()
+            pass_start_sent = sent
+            if _pass > 1:
+                logger.info(
+                    "【STEP12 multi-pass】%d 巡目を開始（累計 %d / 予算 %d・残り枠 %d）",
+                    _pass, sent, budget, budget - sent,
+                )
+                self._mark_progress(f"multi_pass:{_pass}")
+            sent = self._execute_phased_send_pipeline(
+                page, budget, sent, sent_by_step, skipped_steps
+            )
+            self._multi_pass_count = _pass
+            pass_sent = sent - pass_start_sent
+            logger.info(
+                "【STEP12 multi-pass】%d 巡目: %d 件送信（累計 %d / 予算 %d）",
+                _pass, pass_sent, sent, budget,
+            )
+            if sent >= budget:
+                self._multi_pass_stop_reason = "budget_reached"
+                break
+            rem = self._read_remaining_after_phases(page)
+            self._note_remaining_observation(f"after_pass_{_pass}", rem)
+            logger.info(
+                "【STEP12 multi-pass】%d 巡目終了時の残り回数: %s",
+                _pass, rem if rem is not None else "取得できず",
+            )
+            if rem == 0:
+                self._multi_pass_stop_reason = "remaining_zero"
+                break
+            if pass_sent == 0:
+                # 残回数があっても、その巡で 1 件も送れなければ候補が尽きている。
+                # 無限ループ防止のためここで打ち切る（ERROR ではなく完了）。
+                self._multi_pass_stop_reason = "no_sendable_candidates"
+                logger.info(
+                    "【STEP12 multi-pass】%d 巡目は送信 0 件・残り %s → "
+                    "送信可能候補なしとして終了（NO_SENDABLE_CANDIDATES）",
+                    _pass, rem if rem is not None else "不明",
+                )
+                break
+            # rem is None（再取得失敗）だが pass_sent > 0 → 次巡へ継続。
+        else:
+            self._multi_pass_stop_reason = "max_passes"
+            logger.info(
+                "【STEP12 multi-pass】上限 %d 巡に到達 → 終了（累計 %d / 予算 %d）",
+                self.MULTI_PASS_MAX, sent, budget,
+            )
+        return sent
+
     def _read_remaining_after_phases(self, page: Page) -> int | None:
         """フェーズ後の残回数を1回だけ取得する（例外を投げない）.
 
@@ -4515,14 +4595,32 @@ class MiteneSender:
             remaining_final if remaining_final is not None else remaining_after_priority
         )
         if eff_remaining == 0:
+            # §9: 残回数 0 を確認できたら、何巡していても常に「完了」。
             status_hint = "completed"
             note = f"{sent} 件送信し、残り回数を使い切りました。"
         elif isinstance(eff_remaining, int) and eff_remaining > 0:
-            status_hint = "completed_with_remaining"
-            note = (
-                f"{sent} 件送信。残り {eff_remaining} 回は"
-                "安全に送信できる対象が見つからないため終了しました。"
-            )
+            # STEP 13: 残回数があるのに①〜⑤を回し切っても消化できなかった場合は ERROR系。
+            #   - no_sendable_candidates: ある巡で送信 0 件（送信可能対象が尽きた）
+            #   - max_passes           : MULTI_PASS_MAX 巡まで回しても残った
+            #   それ以外（budget 到達等）は従来どおり完了系（completed_with_remaining）。
+            if self._multi_pass_stop_reason == "max_passes":
+                status_hint = "max_passes_reached"
+                note = (
+                    f"{sent} 件送信。①〜⑤を上限 {self.MULTI_PASS_MAX} 巡まで回しましたが "
+                    f"残り {eff_remaining} 回を消化できませんでした。"
+                )
+            elif self._multi_pass_stop_reason == "no_sendable_candidates":
+                status_hint = "no_sendable_candidates"
+                note = (
+                    f"{sent} 件送信。残り {eff_remaining} 回ぶんの送信可能な対象が "
+                    f"①〜⑤に見つからないため停止しました。"
+                )
+            else:
+                status_hint = "completed_with_remaining"
+                note = (
+                    f"{sent} 件送信。残り {eff_remaining} 回は"
+                    "安全に送信できる対象が見つからないため終了しました。"
+                )
         elif sent > 0:
             # 送信は成立したが、終了後の残回数を再確認できなかった
             # （0 と取得失敗を混同しない・ERROR にはしない）
@@ -4546,7 +4644,14 @@ class MiteneSender:
             "remaining_after_priority": remaining_after_priority,
             "remaining_final": remaining_final,
             "consume_status": consume_status,
+            # STEP 12: ①〜⑤を何巡したか／なぜ巡回を止めたか（レポート用）。
+            "multi_pass_count": self._multi_pass_count,
+            "multi_pass_stop_reason": self._multi_pass_stop_reason,
         }
+        if status_hint == "no_sendable_candidates":
+            self._last_run_report["reason"] = "NO_SENDABLE_CANDIDATES"
+        elif status_hint == "max_passes_reached":
+            self._last_run_report["reason"] = "MAX_PASSES_REACHED"
         for lbl, count in sent_by_step.items():
             if count:
                 logger.info("[%s]: %d 件", lbl, count)
@@ -7402,12 +7507,12 @@ class MiteneSender:
             self._emit_send_progress(0, budget)
             self._log_send_pipeline_info()
             logger.info("送信予算: %d 回（gid=%s）", budget, self._gid())
-            sent = self._execute_phased_send_pipeline(
+            # STEP 12: 残回数を使い切るまで（or 進捗が止まるまで）①〜⑤を回す。
+            sent = self._execute_phased_send_loop(
                 page, budget, sent, sent_by_step, skipped_steps
             )
             self._send_target = budget
-            # ①〜⑤後の残回数確認 → 余りをランダム追加消化 → レポート確定。
-            # per-send の残回数取得は廃止し、ここで初めて再取得する。
+            # ①〜⑤（複数巡）後の残回数確認 → 余りをランダム追加消化 → レポート確定。
             return self._finalize_phased_run(
                 page, budget, sent, sent_by_step, skipped_steps
             )

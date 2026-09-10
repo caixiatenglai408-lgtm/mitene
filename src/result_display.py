@@ -17,9 +17,29 @@ def is_completed_with_remaining_result(r: dict[str, Any]) -> bool:
     return r.get("status") == "completed_with_remaining"
 
 
+def is_completed_result(r: dict[str, Any]) -> bool:
+    # STEP 13.1: initial>0 で送信処理へ入り、final remaining=0 を確認できた完了。
+    # sent 件数に関係なく「完了」（＝「残り回数なし」ではない）。
+    return r.get("status") == "completed"
+
+
+def is_no_sendable_candidates_result(r: dict[str, Any]) -> bool:
+    # STEP 13: 残り回数ありで送信対象が尽きた／①〜⑤上限巡到達 → ERROR系。
+    return r.get("status") == "error" and str(r.get("reason") or "") in (
+        "NO_SENDABLE_CANDIDATES",
+        "MAX_PASSES_REACHED",
+    )
+
+
 def classify_result(r: dict[str, Any]) -> str:
     if r.get("skipped"):
         return "skipped"
+    if is_no_sendable_candidates_result(r):
+        # 部分送信があっても ERROR（success 判定より先に確定させる）。
+        return "error"
+    if is_completed_result(r):
+        # 送信処理へ入り final remaining=0 → 完了（sent 件数不問・ERROR ではない）。
+        return "completed"
     if is_completed_with_remaining_result(r):
         # 残り回数 > 0 だが安全な送信候補なし。ERROR ではなく完了系。
         return "completed_with_remaining"
@@ -46,6 +66,9 @@ def _detail_for_completed(r: dict[str, Any], kind: str, *, dry_run: bool) -> str
     if kind == "dry_run" or dry_run:
         return "ドライラン（送信なし）"
     sent = int(r.get("sent") or 0)
+    if kind == "completed":
+        # 送信処理へ入り、残り回数を使い切って完了（sent は 0 のこともある）。
+        return f"完了（{sent} 件送信・残り回数を使い切りました）"
     if kind == "completed_with_remaining":
         rem = r.get("remaining")
         base = f"{sent} 件送信" if sent > 0 else "送信対象なし"
@@ -99,7 +122,13 @@ def build_run_display(
 
         if kind == "skipped":
             continue
-        if kind in ("success", "no_remaining", "dry_run", "completed_with_remaining"):
+        if kind in (
+            "success",
+            "completed",
+            "no_remaining",
+            "dry_run",
+            "completed_with_remaining",
+        ):
             completed.append(
                 {
                     "name": name,

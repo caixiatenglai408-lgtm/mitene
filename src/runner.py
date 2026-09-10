@@ -268,11 +268,18 @@ def run_for_account(
         remaining_final = report.get("remaining_final")
         if dry_run:
             status = "dry_run"
+        elif hint in ("no_sendable_candidates", "max_passes_reached"):
+            # STEP 13: 残り回数があるのに①〜⑤で消化しきれなかった → ERROR系。
+            # 部分送信があっても error（raise はしない＝バッチは次キャストへ自動継続）。
+            status = "error"
         elif sent > 0:
             status = "success"
         elif hint == "completed":
-            # 残り回数を 0 と confident に確認できた → 完了扱い（ERROR にしない）
-            status = "no_remaining"
+            # STEP 13.1: initial>0 で送信処理へ入り、final remaining=0 を confident に
+            # 確認できた（pipeline が走った時点で budget>=1＝initial>0 が保証される）。
+            # sent 件数に関係なく「完了」。「残り回数なし」は initial 0
+            # （DailyLimitReached 経路）だけに限定する。
+            status = "completed"
         elif hint == "completed_with_remaining":
             # 残り回数 > 0 だが安全な送信候補なし → ERROR にしない
             status = "completed_with_remaining"
@@ -285,6 +292,7 @@ def run_for_account(
             "name": account.name,
             "ok": status in (
                 "success",
+                "completed",
                 "no_remaining",
                 "completed_with_remaining",
                 "dry_run",
@@ -293,10 +301,18 @@ def run_for_account(
             "dry_run": dry_run,
             "status": status,
         }
+        if status == "error" and hint in ("no_sendable_candidates", "max_passes_reached"):
+            result["reason"] = str(report.get("reason") or hint.upper())
+            _detail = str(report.get("note") or "").strip()
+            result["error"] = _detail or "残り回数はありますが送信できる対象がありません"
+            result["message"] = result["error"]
         if isinstance(remaining_final, int):
             result["remaining"] = remaining_final
         if sent == 0 and not dry_run:
-            result["message"] = sender.zero_send_message()
+            # STEP 13: NO_SENDABLE_CANDIDATES / MAX_PASSES_REACHED は上で message を
+            # 設定済み。zero_send_message で上書きしない。
+            if "message" not in result:
+                result["message"] = sender.zero_send_message()
             if report:
                 result["report"] = report
     except DailyLimitReached as e:

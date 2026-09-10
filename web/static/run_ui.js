@@ -168,6 +168,12 @@
       });
     } else if (r.status === "no_remaining") {
       completed.push({ name: accountName, detail: "ミテネ残り回数なし" });
+    } else if (r.status === "completed") {
+      // 送信処理へ入り final remaining=0 → 完了（sent は 0 のこともある）
+      completed.push({
+        name: accountName,
+        detail: `完了（${sent} 件送信・残り回数を使い切りました）`,
+      });
     } else if (r.status === "completed_with_remaining") {
       const rem = Number(r.remaining || 0);
       completed.push({
