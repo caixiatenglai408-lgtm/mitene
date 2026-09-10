@@ -44,7 +44,6 @@ from store import (  # noqa: E402
     set_account_working_today,
     delete_account,
     get_account,
-    has_duplicate_name,
     load_settings,
     save_settings,
     set_account_enabled,
@@ -205,10 +204,6 @@ def accounts():
                     error = "表示名とログインIDは必須です"
                 elif not account_id and not password:
                     error = "新規登録時はパスワードが必須です"
-                elif has_duplicate_name(name, account_id) and (
-                    request.form.get("confirm_duplicate") != "1"
-                ):
-                    error = "同姓同名が存在します。登録する場合は確認ダイアログから実行してください"
                 else:
                     upsert_account(
                         name,

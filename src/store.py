@@ -252,19 +252,6 @@ def accounts_sorted_for_display(
     return sorted(src, key=cast_sort_key)
 
 
-def has_duplicate_name(name: str, exclude_id: str | None = None) -> bool:
-    """登録一覧に同じ表示名があるか（更新時は自分自身を除く）."""
-    key = normalize_display_name(name)
-    if not key:
-        return False
-    for a in load_accounts():
-        if exclude_id and a.id == exclude_id:
-            continue
-        if normalize_display_name(a.name) == key:
-            return True
-    return False
-
-
 def upsert_account(
     name: str,
     login_id: str,

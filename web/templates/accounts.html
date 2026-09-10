@@ -22,7 +22,6 @@
   <form method="post" class="form-grid" id="form-account-save">
     <input type="hidden" name="action" value="save">
     <input type="hidden" name="account_id" id="account_id" value="">
-    <input type="hidden" name="confirm_duplicate" id="confirm_duplicate" value="0">
     <div>
       <label for="name">表示名（管理用）</label>
       <input type="text" id="name" name="name" placeholder="例: 山田 花子" required>
@@ -49,16 +48,6 @@
 
 {% set compact = false %}
 {% include "_account_list.html" with context %}
-
-<div id="duplicate-name-modal" class="modal-overlay" hidden aria-hidden="true">
-  <div class="modal-box" role="dialog" aria-labelledby="duplicate-name-title">
-    <p id="duplicate-name-title" class="modal-message">同姓同名が存在します</p>
-    <div class="modal-actions">
-      <button type="button" class="btn-primary" id="btn-dup-confirm">そのまま保存</button>
-      <button type="button" class="btn-secondary" id="btn-dup-cancel">保存せず閉じる</button>
-    </div>
-  </div>
-</div>
 {% endblock %}
 
 {% block scripts %}
@@ -70,61 +59,10 @@ window.existingAccountsData = [
   {% endfor %}
 ];
 
-function normalizeName(value) {
-  return value.trim().replace(/\u3000/g, " ").trim();
-}
-
-function hasDuplicateName(name, excludeId) {
-  const key = normalizeName(name);
-  if (!key) return false;
-  return (window.existingAccountsData || []).some(
-    (a) => a.id !== excludeId && normalizeName(a.name) === key
-  );
-}
-
 const formAccountSave = document.getElementById("form-account-save");
-const duplicateModal = document.getElementById("duplicate-name-modal");
-const confirmDuplicateInput = document.getElementById("confirm_duplicate");
-let skipDuplicateCheck = false;
 
-function openDuplicateModal() {
-  duplicateModal.hidden = false;
-  duplicateModal.setAttribute("aria-hidden", "false");
-}
-
-function closeDuplicateModal() {
-  duplicateModal.hidden = true;
-  duplicateModal.setAttribute("aria-hidden", "true");
-}
-
-formAccountSave.addEventListener("submit", (e) => {
+formAccountSave.addEventListener("submit", () => {
   window.MiteneSync?.pause(8000);
-  if (skipDuplicateCheck) return;
-  const name = document.getElementById("name").value;
-  const accountId = document.getElementById("account_id").value;
-  if (!hasDuplicateName(name, accountId)) {
-    confirmDuplicateInput.value = "0";
-    return;
-  }
-  e.preventDefault();
-  confirmDuplicateInput.value = "0";
-  openDuplicateModal();
-});
-
-document.getElementById("btn-dup-cancel").onclick = () => {
-  closeDuplicateModal();
-};
-
-document.getElementById("btn-dup-confirm").onclick = () => {
-  closeDuplicateModal();
-  confirmDuplicateInput.value = "1";
-  skipDuplicateCheck = true;
-  formAccountSave.requestSubmit();
-  skipDuplicateCheck = false;
-};
-
-duplicateModal.addEventListener("click", (e) => {
-  if (e.target === duplicateModal) closeDuplicateModal();
 });
 
 document.getElementById("btn-clear-form").onclick = () => {
@@ -134,7 +72,6 @@ document.getElementById("btn-clear-form").onclick = () => {
   document.getElementById("login_id").value = "";
   document.getElementById("password").value = "";
   document.getElementById("enabled").checked = true;
-  confirmDuplicateInput.value = "0";
 };
 </script>
 {% endblock %}

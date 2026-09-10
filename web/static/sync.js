@@ -23,9 +23,6 @@
   function shouldSkipSync() {
     if (Date.now() < userQuietUntil) return true;
 
-    const modal = document.getElementById("duplicate-name-modal");
-    if (modal && !modal.hidden) return true;
-
     const runStatus = document.getElementById("run-status");
     if (runStatus && runStatus.classList.contains("running")) return true;
 
