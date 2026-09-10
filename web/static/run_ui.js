@@ -167,7 +167,8 @@
         detail: String(r.error || r.message || "ミテネ残り回数取得失敗"),
       });
     } else if (r.status === "no_remaining") {
-      completed.push({ name: accountName, detail: "ミテネ残り回数なし" });
+      // STEP 16: 内部 status は no_remaining のまま。UI 表示だけ「未完了・エラー」。
+      errors.push({ name: accountName, detail: "ミテネ残り回数が0です" });
     } else if (r.status === "completed") {
       // 送信処理へ入り final remaining=0 → 完了（sent は 0 のこともある）
       completed.push({

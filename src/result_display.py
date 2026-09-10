@@ -83,6 +83,9 @@ def _detail_for_completed(r: dict[str, Any], kind: str, *, dry_run: bool) -> str
 
 
 def _detail_for_error(r: dict[str, Any]) -> str:
+    if is_no_remaining_result(r):
+        # STEP 16: ログイン時点で残り回数 0（内部 status は no_remaining のまま）。
+        return "ミテネ残り回数が0です"
     return (
         str(r.get("error") or r.get("message") or "送信できませんでした")
         .strip()
@@ -122,10 +125,11 @@ def build_run_display(
 
         if kind == "skipped":
             continue
+        # STEP 16: no_remaining（ログイン時点で残り 0）は内部 status を変えずに
+        # UI 表示だけ「未完了・エラー」グループへ（detail は _detail_for_error）。
         if kind in (
             "success",
             "completed",
-            "no_remaining",
             "dry_run",
             "completed_with_remaining",
         ):
