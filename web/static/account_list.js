@@ -310,6 +310,8 @@
       if (btn.classList.contains("btn-edit")) {
         document.getElementById("account_id").value = btn.dataset.id;
         document.getElementById("name").value = btn.dataset.name;
+        const kanaEl = document.getElementById("name_kana");
+        if (kanaEl) kanaEl.value = btn.dataset.kana || "";
         document.getElementById("login_id").value = btn.dataset.login;
         document.getElementById("enabled").checked = btn.dataset.enabled === "true";
         document.getElementById("password").value = "";

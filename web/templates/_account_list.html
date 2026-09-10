@@ -60,7 +60,7 @@
           <span class="hint account-meta">{{ a.login_id }}{% if not a.enabled %} · 自動送信対象外{% endif %}</span>
         </div>
         <div class="actions-inline actions-main actions-main--detail">
-          <button type="button" class="btn-secondary btn-edit" data-id="{{ a.id }}" data-name="{{ a.name }}" data-login="{{ a.login_id }}" data-enabled="{{ 'true' if a.enabled else 'false' }}">編集</button>
+          <button type="button" class="btn-secondary btn-edit" data-id="{{ a.id }}" data-name="{{ a.name }}" data-kana="{{ a.name_kana }}" data-login="{{ a.login_id }}" data-enabled="{{ 'true' if a.enabled else 'false' }}">編集</button>
           <button type="button" class="btn-primary btn-run" data-id="{{ a.id }}" data-name="{{ a.name }}">今すぐ送信</button>
           <button
             type="button"

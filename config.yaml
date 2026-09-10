@@ -12,33 +12,28 @@ mitene:
   member_cooldown_days: 0  # 0=制限なし（同一会員への再送間隔）
   max_no_history_sends_per_day: 0  # 0=制限なし（履歴なし会員への1日上限）
   # 送信順（gid=女の子ID。新規=kitene_question「ミテネ履歴」に「送信済」なし）
+  # ※ 実際の巡回順は src/mitene_sender.py の _execute_phased_send_pipeline が
+  #   ハードコードする。下記の内容は「非空か＝フェーズ制を有効化するか」の判定
+  #   （_send_mitene_standard の `if steps:`）にのみ使われる。順序整合のため記載。
+  #   ①〜⑤の後、残り回数があれば安全候補からランダム追加消化する。
   priority_steps:
-    # ① マイガール（新規会員を最優先）
+    # ① マイガール（新規）
     - tab: マイガール
       member_filter: new_only
       list_path: /J10ComeonMyGirlList.php
-    # ② キープ（新規会員）
+    # ② みたよ（新規）※ 旧「マッチ率新規0件のときのみ」条件は廃止・常時実行
+    - tab: みたよ
+      member_filter: new_only
+      list_path: /J10ComeonVisitorList.php
+    # ③ キープ（新規）
     - tab: キープ
       member_filter: new_only
       list_path: /J10ComeonKeepList.php
-    # ③ マッチ率（新規会員・残りミテネ回数ぶん）
+    # ④ マッチ率（新規・残りミテネ回数ぶん）
     - tab: マッチ率
       member_filter: new_only
       list_path: /J10ComeonAiMatchingList.php
-    # ④ みたよ（③で新規0件のときのみ）
-    - tab: みたよ
-      condition: if_no_match_new
-      member_filter: sendable
-      list_path: /J10ComeonVisitorList.php
-    # ⑤ マイガール（送信日が古い順・同日はランダム）
-    - tab: マイガール
-      member_filter: sent_oldest_first
-      list_path: /J10ComeonMyGirlList.php
-    # ⑥ キープ（送信日が古い順・同日はランダム）
-    - tab: キープ
-      member_filter: sent_oldest_first
-      list_path: /J10ComeonKeepList.php
-    # ⑦ マッチ率（送信日が古い順・同日はランダム）
+    # ⑤ マッチ率（ミテネ履歴あり・送信日が古い順・同日はランダム）
     - tab: マッチ率
       member_filter: sent_oldest_first
       list_path: /J10ComeonAiMatchingList.php

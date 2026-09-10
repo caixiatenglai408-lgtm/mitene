@@ -33,9 +33,10 @@ setup_runtime()
 
 from job_runner import get_job, is_system_busy, start_background_job, validate_before_run  # noqa: E402
 from runner import run_for_account  # noqa: E402
-from scheduler_service import run_manual_batch, run_single_account, start_scheduler  # noqa: E402
+from scheduler_service import run_manual_batch, run_single_account  # noqa: E402
 from store import (  # noqa: E402
     JST,
+    accounts_sorted_for_display,
     attendance_today_label,
     load_working_today_ids,
     partition_enabled_by_attendance,
@@ -44,12 +45,9 @@ from store import (  # noqa: E402
     delete_account,
     get_account,
     has_duplicate_name,
-    load_accounts,
     load_settings,
     save_settings,
     set_account_enabled,
-    set_automation,
-    toggle_schedule,
     upsert_account,
 )
 
@@ -165,7 +163,7 @@ def index():
     return render_template(
         "index.html",
         settings=settings,
-        accounts=load_accounts(),
+        accounts=accounts_sorted_for_display(),
         working_today=working_today,
         off_today=off_today,
         attendance_label=attendance_today_label(),
@@ -183,6 +181,7 @@ def accounts():
         action = request.form.get("action", "save")
         account_id = request.form.get("account_id", "").strip() or None
         name = request.form.get("name", "")
+        name_kana = request.form.get("name_kana", "")
         login_id = request.form.get("login_id", "")
         password = request.form.get("password", "")
         enabled = request.form.get("enabled") == "on"
@@ -211,7 +210,14 @@ def accounts():
                 ):
                     error = "同姓同名が存在します。登録する場合は確認ダイアログから実行してください"
                 else:
-                    upsert_account(name, login_id, password, account_id, enabled)
+                    upsert_account(
+                        name,
+                        login_id,
+                        password,
+                        account_id,
+                        enabled,
+                        name_kana=name_kana,
+                    )
                     message = "保存しました"
         except Exception as e:
             error = str(e)
@@ -219,7 +225,7 @@ def accounts():
     return render_template(
         "accounts.html",
         settings=load_settings(),
-        accounts=load_accounts(),
+        accounts=accounts_sorted_for_display(),
         message=message,
         error=error,
     )
@@ -232,33 +238,6 @@ def api_delete_account(account_id: str):
         return jsonify({"ok": False, "error": "アカウントが見つかりません"}), 404
     delete_account(account_id)
     return jsonify({"ok": True, "message": f"「{acc.name}」を削除しました"})
-
-
-@app.post("/api/automation")
-def api_automation():
-    enabled = request.json.get("enabled", False)
-    settings = set_automation(bool(enabled))
-    return jsonify({"ok": True, "automation_enabled": settings.automation_enabled})
-
-
-@app.post("/api/schedule/toggle")
-def api_schedule_toggle():
-    data = request.json or {}
-    day = data.get("day", "")
-    slot = data.get("slot", "")
-    try:
-        settings = toggle_schedule(day, slot)
-        return jsonify(
-            {
-                "ok": True,
-                "day": day,
-                "slot": slot,
-                "enabled": settings.schedule[day][slot],
-                "schedule": settings.schedule,
-            }
-        )
-    except ValueError as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @app.post("/api/run-now")
@@ -610,24 +589,17 @@ def api_client_heartbeat_status():
 
 def _build_data_payload() -> dict:
     from data_store import storage_debug, storage_mode, storage_warning
-    from platform_schedule import platform_schedule_status
 
     s = load_settings()
-    accounts = [a.to_public() for a in load_accounts()]
+    accounts = [a.to_public() for a in accounts_sorted_for_display()]
     working, off = partition_enabled_by_attendance()
-    info = platform_schedule_status(s)
     last_run = s.last_run if isinstance(s.last_run, dict) else None
     return {
         "ok": True,
-        "automation_enabled": s.automation_enabled,
         "base_url_set": bool(s.base_url),
         "base_url": s.base_url,
         "accounts_count": len(accounts),
         "accounts": accounts,
-        "schedule": s.schedule,
-        "sleep_schedule_enabled": s.sleep_schedule_enabled,
-        "platform_schedule": info,
-        "mac_schedule": info,
         "server_time": datetime.now(JST).strftime("%H:%M"),
         "last_run": last_run,
         "attendance_date": s.attendance_date,
@@ -641,40 +613,7 @@ def _build_data_payload() -> dict:
     }
 
 
-@app.post("/api/sleep-schedule")
-def api_sleep_schedule():
-    from platform_schedule import set_sleep_schedule
-
-    enabled = bool((request.json or {}).get("enabled", True))
-    settings = set_sleep_schedule(enabled)
-    return jsonify(
-        {
-            "ok": True,
-            "sleep_schedule_enabled": settings.sleep_schedule_enabled,
-        }
-    )
-
-
-@app.post("/api/mac-schedule/sync")
-def api_mac_schedule_sync():
-    if sys.platform not in ("darwin", "win32"):
-        return jsonify({"ok": False, "error": "Mac / Windows のみ対応"}), 400
-    from platform_schedule import sync_platform_schedule
-
-    info = sync_platform_schedule()
-    return jsonify({"ok": True, **info})
-
-
 def main():
-    start_scheduler()
-    if sys.platform in ("darwin", "win32"):
-        try:
-            from platform_schedule import sync_platform_schedule
-
-            info = sync_platform_schedule()
-            logging.info("OS 定時登録: %s", info.get("message", info))
-        except Exception:
-            logging.exception("OS 定時登録の同期に失敗")
     port = int(__import__("os").getenv("PORT", "5050"))
     app.run(
         host="0.0.0.0",

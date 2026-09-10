@@ -13,6 +13,7 @@ from human_behavior import HumanBehavior
 from mitene_sender import (
     BUDGET_READ_FAILED_PREFIX,
     DEFAULT_PRIORITY_STEPS,
+    AccountStallTimeout,
     BrowserConfig,
     DailyLimitReached,
     LoginConfig,
@@ -262,19 +263,42 @@ def run_for_account(
             progress_callback=get_send_progress_callback(),
         )
         sent = sender.run()
-        status = "dry_run" if dry_run else ("success" if sent > 0 else "zero_send")
+        report = getattr(sender, "_last_run_report", None) or {}
+        hint = str(report.get("status_hint") or "")
+        remaining_final = report.get("remaining_final")
+        if dry_run:
+            status = "dry_run"
+        elif sent > 0:
+            status = "success"
+        elif hint == "completed":
+            # 残り回数を 0 と confident に確認できた → 完了扱い（ERROR にしない）
+            status = "no_remaining"
+        elif hint == "completed_with_remaining":
+            # 残り回数 > 0 だが安全な送信候補なし → ERROR にしない
+            status = "completed_with_remaining"
+        elif hint == "budget_read_failed":
+            status = "budget_read_failed"
+        else:
+            status = "zero_send"
         result = {
             "account_id": account.id,
             "name": account.name,
-            "ok": True,
+            "ok": status in (
+                "success",
+                "no_remaining",
+                "completed_with_remaining",
+                "dry_run",
+            ),
             "sent": sent,
             "dry_run": dry_run,
             "status": status,
         }
+        if isinstance(remaining_final, int):
+            result["remaining"] = remaining_final
         if sent == 0 and not dry_run:
             result["message"] = sender.zero_send_message()
-            if sender._last_run_report:
-                result["report"] = sender._last_run_report
+            if report:
+                result["report"] = report
     except DailyLimitReached as e:
         sent = resolve_sent_this_run(sender)
         result = {
@@ -284,6 +308,22 @@ def run_for_account(
             "sent": sent,
             "status": "no_remaining",
             "message": str(e),
+            "dry_run": dry_run,
+        }
+        if sender is not None and sender._last_run_report:
+            result["report"] = sender._last_run_report
+    except AccountStallTimeout as e:
+        # 10分超＋実質停止 → このアカウントだけ timeout 扱い（batch は継続・§9）。
+        sent = resolve_sent_this_run(sender)
+        logger.warning("%s: アカウント処理を打ち切り（%s）", account.name, e)
+        result = {
+            "account_id": account.id,
+            "name": account.name,
+            "ok": False,
+            "sent": sent,
+            "status": "timeout",
+            "error": f"アカウント処理を打ち切り: {e}",
+            "message": f"10分を超え進捗が停止したため打ち切りました（{sent} 件送信済）",
             "dry_run": dry_run,
         }
         if sender is not None and sender._last_run_report:

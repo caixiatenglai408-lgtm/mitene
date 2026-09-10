@@ -10,6 +10,7 @@ import random
 import re
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 from datetime import date, datetime
@@ -106,6 +107,37 @@ def _is_destroyed_context_error(exc: BaseException) -> bool:
 
 def _normalize_digits(text: str) -> str:
     return text.translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
+
+
+# ── Performance 計測（MITENE_PERF=1 のときだけ [perf] ログを出す。挙動は不変）──
+_PERF_ENABLED = os.environ.get("MITENE_PERF") == "1"
+
+
+def _perf_log(event: str, **fields: Any) -> None:
+    """`[perf] event key=value ...` を既存 logger に出力（MITENE_PERF=1 時のみ）.
+
+    このモジュールの計測は「時刻を測ってログに出す」以外の副作用を持たない。
+    MITENE_PERF が 1 でないときは何もしない（従来どおりの挙動）。
+    """
+    if not _PERF_ENABLED:
+        return
+    if fields:
+        parts = " ".join(
+            f"{k}={v}" for k, v in fields.items() if v is not None
+        )
+        logger.info("[perf] %s %s", event, parts)
+    else:
+        logger.info("[perf] %s", event)
+
+
+def _perf_tab_slug(tab: str) -> str:
+    """一覧タブ名 → ASCII の安全な識別子（ログにURL/query を出さないため）."""
+    return {
+        "マイガール": "mygirl",
+        "キープ": "keep",
+        "マッチ率": "match",
+        "みたよ": "visitor",
+    }.get(tab, "list")
 
 
 @dataclass
@@ -267,6 +299,16 @@ MEMBER_CARD_COUNT_JS = (
     + "return collectMemberCards().length;}"
 )
 
+# adaptive wait 用: 既存の MEMBER_CARD_COUNT_JS（= collectMemberCards().length）と
+# _get_list_scroll_height() の式（Math.max(body/documentElement.scrollHeight)）を
+# 1回の evaluate で返すだけ。新しい selector は追加していない。
+MEMBER_CARD_COUNT_HEIGHT_JS = (
+    "() => {"
+    + MEMBER_CARD_HELPERS_JS
+    + "return [collectMemberCards().length, Math.max("
+    + "document.body.scrollHeight, document.documentElement.scrollHeight)];}"
+)
+
 MEMBER_CARD_DEBUG_JS = (
     "() => {"
     + MEMBER_CARD_HELPERS_JS
@@ -274,7 +316,7 @@ MEMBER_CARD_DEBUG_JS = (
 )
 
 MEMBER_CARD_PARSE_JS = (
-    "({ historyLabel }) => {"
+    "({ historyLabel, matchStrict }) => {"
     + MEMBER_CARD_HELPERS_JS
     + """
     const extractName = (card) => {
@@ -339,6 +381,7 @@ MEMBER_CARD_PARSE_JS = (
         const box = card.querySelector('.kitene_question')
             || card.querySelector('.kitene_question_box');
         const scope = box || card;
+        // Path 1: 「ミテネ履歴」ラベルに対応する .answer / .answer.compatibility の値だけ。
         for (const li of scope.querySelectorAll('li')) {
             const q = (li.querySelector('.question')?.innerText || '').trim();
             if (!q.includes(historyLabel)) continue;
@@ -349,7 +392,11 @@ MEMBER_CARD_PARSE_JS = (
             ).trim();
             break;
         }
-        if (!historyText) {
+        // Path 2（fallback）: 「ミテネ履歴」で始まる親要素の innerText 残り全部を history にする。
+        //   マッチ率カードでは マッチング率 / 誕生日 / 会員登録日 / 最終ログイン / アクセス日 等
+        //   別項目の日付が混入し「履歴なし → 履歴あり」に誤分類される（監査で確認）。
+        //   → matchStrict のとき Path 2 を無効化。他タブ（①②③）は従来どおり動かす。
+        if (!historyText && !matchStrict) {
             for (const row of scope.querySelectorAll('li, dl, tr, div')) {
                 const t = (row.innerText || '').trim();
                 if (!t.startsWith(historyLabel)) continue;
@@ -615,9 +662,10 @@ class PriorityStep:
     max_members: int = 0  # 0 = 残りミテネ回数ぶん
 
 
-# 送信順（config 未設定時の既定）
-# ①マイガール(新規) → ②キープ(新規) → ③マッチ率(新規・残り回数) →
-# ④マイガール（古い順）→ ⑤みたよ(マッチ率新規0件時のみ) → ⑥キープ → ⑦マッチ率（古い順）
+# config 未設定時の「フェーズ制送信を有効化するか」の既定値（中身の順序は使われない）。
+# 実際の送信順は _execute_phased_send_pipeline がハードコードする新5フェーズ:
+#   ①マイガール新規 → ②みたよ新規 → ③キープ新規 → ④マッチ率新規 → ⑤マッチ率（古い順）
+#   （その後、残り回数があれば安全候補からランダム追加消化する）
 DEFAULT_PRIORITY_STEPS: list[PriorityStep] = [
     PriorityStep(
         tab="マイガール",
@@ -625,6 +673,11 @@ DEFAULT_PRIORITY_STEPS: list[PriorityStep] = [
         list_path="/J10ComeonMyGirlList.php",
     ),
     PriorityStep(
+        tab="みたよ",
+        member_filter="new_only",
+        list_path="/J10ComeonVisitorList.php",
+    ),
+    PriorityStep(
         tab="キープ",
         member_filter="new_only",
         list_path="/J10ComeonKeepList.php",
@@ -633,22 +686,6 @@ DEFAULT_PRIORITY_STEPS: list[PriorityStep] = [
         tab="マッチ率",
         member_filter="new_only",
         list_path="/J10ComeonAiMatchingList.php",
-    ),
-    PriorityStep(
-        tab="マイガール",
-        member_filter="sent_oldest_first",
-        list_path="/J10ComeonMyGirlList.php",
-    ),
-    PriorityStep(
-        tab="みたよ",
-        condition="if_no_match_new",
-        member_filter="sendable",
-        list_path="/J10ComeonVisitorList.php",
-    ),
-    PriorityStep(
-        tab="キープ",
-        member_filter="sent_oldest_first",
-        list_path="/J10ComeonKeepList.php",
     ),
     PriorityStep(
         tab="マッチ率",
@@ -656,12 +693,6 @@ DEFAULT_PRIORITY_STEPS: list[PriorityStep] = [
         list_path="/J10ComeonAiMatchingList.php",
     ),
 ]
-
-# ⑥〜⑦: キープ・マッチ率を送信日古い順に巡回（④マイガールはフェーズ1後に個別実行）
-OLDEST_FIRST_PHASE_TABS: tuple[tuple[str, str, str], ...] = (
-    ("⑥キープ（古い順）", "キープ", "/J10ComeonKeepList.php"),
-    ("⑦マッチ率（古い順）", "マッチ率", "/J10ComeonAiMatchingList.php"),
-)
 
 # 一覧URL遷移後に DOM が安定するまで待つセレクタ
 LIST_PAGE_READY_SELECTORS = (
@@ -684,8 +715,16 @@ LIST_URL_FIX_TIMEOUT_MS = 10000
 FINAL_FORCED_WAIT_MS = 3000
 # 直打ちリトライ回数（ループ内）
 LIST_NAV_ATTEMPTS = 3
-# 一覧 Ajax 遅延読込待ち（ミリ秒）
+# 一覧 Ajax 遅延読込待ち（ミリ秒）— 旧方式の固定 sleep。
+# 現在は adaptive wait（下記）の fallback / reference 値としてのみ使用。削除しない。
 LIST_AJAX_LOAD_WAIT_MS = (2000, 3000)
+# adaptive card-load wait（Phase 2.2C）: 実測（Phase 2.2B-2）
+#   1スクロール = 1バッチ・原子的追加・ロード ~460-970ms・バースト後は無変化。
+#   card_count / scrollHeight の増加を短間隔 poll し、settle window 経過で完了と判定。
+LIST_AJAX_POLL_MS = 100          # poll 間隔
+LIST_AJAX_SETTLE_MS = 400        # 最後のカード追加後、この時間 無変化なら完了
+LIST_AJAX_NO_MORE_MS = 1200      # カードが増えないままこの時間経過なら「追加なし」で完了（安全側に大きめ）
+LIST_AJAX_ADAPTIVE_CAP_MS = 3000  # adaptive 監視の上限（従来の実効上限とほぼ同じ・安全側）
 # scrollHeight / カード数 / uniqueMemberIds が変化しない連続回数
 LIST_SCROLL_STABLE_ROUNDS = 4
 # スクロール→解析→マージの最大ループ回数
@@ -702,6 +741,16 @@ MEMBER_CARD_WAIT_SELECTORS: tuple[str, ...] = (
 LIST_RENDER_POLL_MS = 500
 LIST_RENDER_WAIT_MAX_MS = 8000
 LIST_ZERO_RETRY_WAIT_MS = 3000
+
+# ── マッチ率（AiMatching）専用の初期一覧 ready 待機（match-adaptive-wait）──
+#   マッチ率は遷移後に CityHeaven 側が候補を段階生成するため、他タブと同じ
+#   「card>0 で即 ready」では premature parse / partial list / 0件誤判定になり得る。
+#   マッチ率のときだけ「loading 消失 ＋ card 数が連続で無変化」まで待つ。
+#   他タブ（マイガール/みたよ/キープ）は一切変更しない。
+MATCH_LIST_RENDER_WAIT_MAX_MS = 20000  # マッチ率のみ初期描画待ちの上限（既存 profile fallback の 22000 と整合・最小側）
+MATCH_LIST_STABLE_POLLS = 2            # loading 消失後、card 数がこの poll 数連続で無変化なら ready
+MATCH_AJAX_NO_MORE_MS = 2500           # マッチ率のみ _ajax_list_load_wait の「増加なし完了」判定を延長（既定 LIST_AJAX_NO_MORE_MS=1200）
+MATCH_MIN_STABLE_CARDS = 1             # ⑤収集がこれ以下 ＋ MATCH_LOAD_TIMEOUT のとき 1 回だけ再確認
 
 
 LIST_LOADING_GONE_JS = """
@@ -884,6 +933,19 @@ class DailyLimitReached(Exception):
     """送信可能回数が残っていない（budget == 0 のときのみ）."""
 
 
+class AccountStallTimeout(Exception):
+    """1アカウントが ACCOUNT_SOFT_LIMIT を超え、かつ一定時間 meaningful progress が
+    無い（＝実質停止）ため安全に打ち切る。通常 ERROR とは区別し、次アカウントへ進む。
+    """
+
+
+# STEP 6: 1アカウントの目安処理時間。これ自体は強制終了時刻ではない。
+# 「600秒超 かつ STALL_THRESHOLD 秒 meaningful progress なし かつ critical send 中でない」
+# のときだけ AccountStallTimeout を送出する。
+ACCOUNT_SOFT_LIMIT_SECONDS = 600
+ACCOUNT_STALL_THRESHOLD_SECONDS = 90
+
+
 BUDGET_READ_FAILED_PREFIX = "ミテネ残り回数取得失敗"
 
 
@@ -1002,16 +1064,37 @@ class MiteneSender:
         self._member_send_log = self.log_dir / "member_sends.jsonl"
         self._sent_member_keys: set[str] = set()
         self._failed_member_keys: set[str] = set()
+        # STEP 4: XHR で成否が確定できなかった会員（POST 済みの可能性 → 同一 run で再送しない）
+        self._uncertain_member_keys: set[str] = set()
+        # STEP 4: 直近の /J10AjaxComeon.php レスポンス（受動観測・最大20件）
+        self._recent_ajax_comeon: list[dict[str, Any]] = []
+        # STEP 6: 10分制御（time.monotonic ベース。wall-clock では判定しない）
+        self._acc_timer_on: bool = False
+        self._acc_started_at: float = 0.0
+        self._last_progress_at: float = 0.0
+        self._current_phase: str = ""
+        self._critical_send: bool = False
+        # STEP 4: 当日すでに member_sends.jsonl に成功記録がある会員キー（cooldown とは独立の hard guard）
+        self._sent_today_keys: set[str] = set()
         self._member_last_sent: dict[str, date] = {}
+        # STEP 4: 1 invocation の一意 ID（retry は同じ ID を使い回す）
+        self._run_id: str = ""
+        # STEP 4: reconciliation 用の残回数観測（[{"at": str, "value": int|None, "date": str}]）
+        self._remaining_observations: list[dict[str, Any]] = []
+        self._member_sends_written_this_run: int = 0
+        self._reconc_finalized: bool = False
         self._send_button_queue: list[str] = []  # comeon-{会員ID}
         self._last_run_report: dict[str, Any] = {}
+        # 直近の一覧描画待機の結果（match-adaptive-wait）:
+        #   "ready" / "empty_stable"（候補0件で正常安定） / "match_load_timeout"
+        #   / "timeout"（非Matchの従来タイムアウト） / ""（未実施）
+        self._last_list_render_status: str = ""
         self._current_list_path: str = ""
         self._current_step: PriorityStep | None = None
         self._send_target: int = 0
         self._send_done: int = 0
         self._locked_send_budget: int | None = None
         self._no_history_sent_today: int = 0
-        self._match_rate_had_new: bool | None = None
         self._pipeline_had_new_member: bool = False
         self._cached_list_cards: list[dict[str, Any]] | None = None
         self._cached_list_url: str = ""
@@ -1030,6 +1113,25 @@ class MiteneSender:
         self._last_send_attempt: dict[str, str] | None = None
         self._last_goto_access_block = False
         self._last_nav_action: str = ""
+        # ── perf 計測用アキュムレータ（MITENE_PERF 無効時は書かれても参照されない）──
+        self._perf: dict[str, float] = {}
+        self._perf_acc_t0: float = 0.0
+        self._perf_parse_remaining_calls: int = 0
+        self._perf_confirm_loops: int = 0
+        self._perf_send_rb: int | None = None
+        self._perf_send_ra: int | None = None
+        self._perf_fetch_counts: dict[str, int] = {}
+        self._perf_last_forced_retries: int = 0
+        self._perf_last_parse_cache_hit: bool = False
+        self._perf_login_attempts: int = 0
+        self._perf_login_session_reused: bool = False
+        self._perf_budget_zero_retry: bool = False
+        self._perf_ensure_went_back: bool = False
+        self._perf_ensure_profile_entry: bool = False
+
+    def _perf_add(self, key: str, ms: float) -> None:
+        if _PERF_ENABLED:
+            self._perf[key] = self._perf.get(key, 0.0) + ms
 
     def _set_nav_debug_action(self, action: str) -> None:
         """framenavigated ログと突き合わせる直前操作の記録."""
@@ -1660,9 +1762,80 @@ class MiteneSender:
             except Exception:
                 pass
 
+        def _on_response(resp) -> None:
+            # STEP 4 §5: 送信の実 XHR（/J10AjaxComeon.php）の結果を記録するだけ。
+            # CTA クリック・native confirm・DOM フローは一切変更しない（受動的観測）。
+            try:
+                url = resp.url or ""
+                if "J10AjaxComeon.php" not in url:
+                    return
+                body: Any = None
+                try:
+                    body = resp.json()
+                except Exception:
+                    try:
+                        body = json.loads(resp.text() or "")
+                    except Exception:
+                        body = None
+                post = ""
+                try:
+                    rq = resp.request
+                    post = (rq.post_data or "") if rq is not None else ""
+                except Exception:
+                    post = ""
+                self._recent_ajax_comeon.append(
+                    {"t": time.monotonic(), "url": url, "body": body, "post": post}
+                )
+                if len(self._recent_ajax_comeon) > 20:
+                    self._recent_ajax_comeon = self._recent_ajax_comeon[-20:]
+            except Exception:
+                pass
+
         page.on("dialog", _on_dialog)
         page.on("framenavigated", _on_frame_navigated)
         page.on("load", _on_load)
+        page.on("response", _on_response)
+
+    def _ajax_comeon_verdict(self, member_id: str, *, since: float) -> str:
+        """`since`（monotonic）以降に観測した /J10AjaxComeon.php から会員の送信成否を判定.
+
+        STEP 4.1: AUTHORITATIVE SUCCESS は「JSON dict かつ process_status == "success"」
+        の場合のみ。status / result は success の別名として扱わない。
+        ok / 1 / true / done 等の未確認の成功値も採用しない。
+
+        戻り値:
+          "success"  … JSON dict かつ process_status == "success"
+          "failure"  … JSON dict かつ process_status が存在し "success" 以外
+          "none"     … 該当 response なし / JSON 化不可 / process_status キー不明（＝不確定）
+        別会員の post_data と明確に分かる response は無視する。
+        post_data が取得できた場合は member_id 一致を必須とする（§7）。
+        """
+        mid = str(member_id or "").strip()
+        verdict = "none"
+        for rec in self._recent_ajax_comeon:
+            if rec.get("t", 0.0) < since:
+                continue
+            body = rec.get("body")
+            if not isinstance(body, dict):
+                continue
+            post = str(rec.get("post") or "")
+            # POST body が読めた場合は対象会員の request か必須確認（§7）
+            if post and mid and mid not in post:
+                continue
+            # process_status のみを見る（status / result は別名扱いしない・§2）
+            if "process_status" not in body:
+                continue
+            status = body.get("process_status")
+            if str(status).strip().lower() == "success":
+                return "success"
+            verdict = "failure"
+        return verdict
+
+    def _saw_ajax_comeon_since(self, since: float) -> bool:
+        """`since` 以降に /J10AjaxComeon.php の response を1件でも観測したか."""
+        return any(
+            r.get("t", 0.0) >= since for r in self._recent_ajax_comeon
+        )
 
     def _safe_inner_text(self, page: Page) -> str:
         try:
@@ -1678,7 +1851,32 @@ class MiteneSender:
         self._locked_send_budget = None
         sent = 0
 
+        # STEP 4: 1 invocation = 1 run_id（retry は同じ ID）。実績セットは invocation 頭で
+        # 一度だけクリアし、attempt をまたいで保持する（retry で成功実績を失わない §7）。
+        self._run_id = uuid.uuid4().hex
+        self._sent_member_keys.clear()
+        self._failed_member_keys.clear()
+        self._uncertain_member_keys.clear()
+        self._send_done = 0
+        self._remaining_observations = []
+        self._member_sends_written_this_run = 0
+        self._reconc_finalized = False
+        self._reconc_started_at = datetime.now().isoformat(timespec="seconds")
+        # STEP 6: 10分制御タイマー開始
+        self._acc_started_at = time.monotonic()
+        self._last_progress_at = self._acc_started_at
+        self._acc_timer_on = True
+        self._current_phase = ""
+        self._critical_send = False
+
+        self._perf = {}
+        self._perf_acc_t0 = time.monotonic()
+        self._perf_parse_remaining_calls = 0
+        self._perf_fetch_counts = {}
+        _perf_log("account_start")
+
         with sync_playwright() as p:
+            _perf_bt0 = time.monotonic()
             browser = self._launch(p)
             page = None
             for attempt in range(2):
@@ -1689,15 +1887,38 @@ class MiteneSender:
                 page = context.new_page()
                 page.set_default_timeout(self.browser_cfg.timeout_ms)
                 self._attach_page_handlers(page)
+                if _PERF_ENABLED and attempt == 0:
+                    _perf_log(
+                        "browser_launched",
+                        ms=int((time.monotonic() - _perf_bt0) * 1000),
+                    )
                 try:
+                    _perf_lt0 = time.monotonic()
                     self._ensure_logged_in(page, context)
+                    # ログイン成功／有効セッション利用を確認した直後に保存する。
+                    # 送信・収集本体で例外が出ても、取得済みの __lt__sid を失わない
+                    # ようにするための2段構え（1段目）。best-effort（保存失敗で run を止めない）。
+                    self._persist_storage_state(context, when="login")
+                    if _PERF_ENABLED:
+                        _lms = (time.monotonic() - _perf_lt0) * 1000
+                        self._perf_add("login_ms", _lms)
+                        _perf_log(
+                            "login_done",
+                            ms=int(_lms),
+                            session_reused=self._perf_login_session_reused,
+                            attempts=self._perf_login_attempts,
+                        )
                     if self.flow == "gift":
                         self._send_mitene_gift(page)
                         sent = 0 if self.dry_run else 1
                         if not self.dry_run:
                             self._record_sent(count=1, flow="gift")
                     else:
-                        sent = self._send_mitene_standard(page)
+                        # retry（attempt 1）では attempt 0 の途中成功数（_send_done）から継続。
+                        # budget は _locked_send_budget が固定なので二重に送らない（§7-C）。
+                        sent = self._send_mitene_standard(
+                            page, sent_so_far=self._send_done
+                        )
                         if not self.dry_run and sent > 0:
                             self._record_sent(count=sent, flow="standard")
                     if self.auth_state_path:
@@ -1709,10 +1930,35 @@ class MiteneSender:
                     from job_runner import JobCancelled
 
                     if isinstance(e, JobCancelled):
+                        # storage_state は cancel では保存しない（既存仕様維持）。
+                        # reconciliation は可能な範囲で残す（storage_state とは別物）。
+                        self._finalize_reconciliation(
+                            status="cancelled", cancelled=True
+                        )
+                        context.close()
+                        raise
+                    if isinstance(e, DailyLimitReached):
+                        # 残回数0 = 正常終了（ERROR ではない・§TEST9）。
+                        self._finalize_reconciliation(status="no_remaining")
+                        self._persist_storage_state(context, when="exception")
+                        context.close()
+                        raise
+                    if isinstance(e, AccountStallTimeout):
+                        # 10分超＋実質停止 → このアカウントだけ安全終了（次アカウントへ）。
+                        # HOME へ無理に remaining を取りに行かない（§10）。
+                        logger.warning("アカウント処理を打ち切り: %s", e)
+                        self._finalize_reconciliation(
+                            status="timeout", died_midrun=True
+                        )
+                        self._persist_storage_state(context, when="exception")
                         context.close()
                         raise
                     if self.screenshot_on_error and page:
                         self._save_error_screenshot(page)
+                    # best-effort: 例外時も、その時点で有効なセッション（ログイン直後に
+                    # 更新済みの __lt__sid 等）を保存しておく。保存失敗は握りつぶし、
+                    # 元の送信例外・retry 判定・再送出フローには一切影響させない。
+                    self._persist_storage_state(context, when="exception")
                     context.close()
                     msg = str(e).lower()
                     blocked = self._is_transient_access_block(page, error=e)
@@ -1729,9 +1975,91 @@ class MiteneSender:
                                 "ページ読み込み失敗（SSL/通信エラー）を検知",
                             )
                         continue
+                    # retry せず送出 → この invocation は途中終了（実績は member_sends に残る）
+                    self._finalize_reconciliation(
+                        status="error", died_midrun=True
+                    )
                     raise
             browser.close()
+        # 正常完了（break 経由）— reconciliation を確定
+        self._finalize_reconciliation(
+            status=str((self._last_run_report or {}).get("status_hint") or "completed")
+        )
+
+        if _PERF_ENABLED:
+            _perf_total = int((time.monotonic() - self._perf_acc_t0) * 1000)
+            p = self._perf
+            _perf_budget = (
+                self._locked_send_budget
+                if self._locked_send_budget is not None
+                else -1
+            )
+            _perf_log(
+                "account_done",
+                ms_total=_perf_total,
+                sent=sent,
+                budget=_perf_budget,
+                phases_run=int(p.get("phases_run", 0)),
+                list_fetches=int(p.get("list_fetches", 0)),
+                redundant_fetches=int(p.get("redundant_fetches", 0)),
+            )
+            _explore = int(
+                p.get("nav_ms", 0.0)
+                + p.get("render_wait_ms", 0.0)
+                + p.get("scroll_parse_ms", 0.0)
+                + p.get("zero_retry_ms", 0.0)
+                + p.get("filter_ms", 0.0)
+            )
+            _perf_log(
+                "account_summary",
+                total_ms=_perf_total,
+                login_ms=int(p.get("login_ms", 0.0)),
+                budget_ms=int(p.get("budget_ms", 0.0)),
+                explore_ms=_explore,
+                send_ms=int(p.get("send_ms", 0.0)),
+                nav_ms=int(p.get("nav_ms", 0.0)),
+                render_wait_ms=int(p.get("render_wait_ms", 0.0)),
+                scroll_parse_ms=int(p.get("scroll_parse_ms", 0.0)),
+                filter_ms=int(p.get("filter_ms", 0.0)),
+                ensure_list_ms=int(p.get("ensure_list_ms", 0.0)),
+                zero_retry_ms=int(p.get("zero_retry_ms", 0.0)),
+                queue_refill_ms=int(p.get("queue_refill_ms", 0.0)),
+                redundant_fetch_ms=int(p.get("redundant_fetch_ms", 0.0)),
+                list_fetches=int(p.get("list_fetches", 0)),
+                scroll_rounds=int(p.get("scroll_rounds", 0)),
+                sent=sent,
+            )
         return sent
+
+    def _persist_storage_state(
+        self, context: BrowserContext, *, when: str
+    ) -> bool:
+        """現在の context の storage_state を auth_state_path へ保存する（best-effort）.
+
+        呼び出しタイミング:
+          - "login"      : _ensure_logged_in 直後（ログイン成功／セッション再利用の確定時）
+          - "exception"  : 送信中に例外が出た後（それまでに取得済みの新しいセッションを退避）
+        ※ 送信・収集本体が正常終了した後の保存は run() 内の既存処理（raise あり）を
+          そのまま維持しており、この best-effort ヘルパは経由しない。
+        保存に失敗しても呼び出し側の制御フロー（特に送信例外の再送出・retry 判定）は
+        壊さない。auth_state_path 未設定なら何もしない。
+        """
+        if not self.auth_state_path:
+            return False
+        try:
+            self.auth_state_path.parent.mkdir(parents=True, exist_ok=True)
+            context.storage_state(path=str(self.auth_state_path))
+            logger.debug(
+                "storage_state を保存しました (%s): %s",
+                when,
+                self.auth_state_path,
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 - 保存失敗で本処理を止めない
+            logger.warning(
+                "storage_state の保存に失敗しました (%s、処理は継続): %s", when, e
+            )
+            return False
 
     def _launch(self, p: Playwright) -> Browser:
         ws_endpoint = (os.getenv("PLAYWRIGHT_BROWSER_WS_ENDPOINT") or "").strip()
@@ -1851,12 +2179,16 @@ class MiteneSender:
                 self.human.action_pause()
                 if self._looks_logged_in(page):
                     logger.info("ログイン済み（セッション利用）")
+                    self._perf_login_attempts = attempt
+                    self._perf_login_session_reused = True
                     self._finish_logged_in(page)
                     return
 
                 ok, err = self._attempt_login(page)
                 if ok:
                     logger.info("①ログイン成功 → ②ホームへ")
+                    self._perf_login_attempts = attempt
+                    self._perf_login_session_reused = False
                     self._finish_logged_in(page)
                     return
                 last_error = err
@@ -2002,6 +2334,7 @@ class MiteneSender:
 
     def _parse_remaining_count(self, page: Page) -> int | None:
         """CTA付近・ラベル・本文から「ミテネ残り回数：N回」を取得."""
+        self._perf_parse_remaining_calls += 1
         try:
             return self._parse_remaining_count_inner(page)
         except Exception as e:
@@ -2198,8 +2531,35 @@ class MiteneSender:
         zero_sources = {source for source, value in reads if value == 0}
         return bool(zero_sources & {"cta", "label", "retry", "list"})
 
+    def _mitene_used_up_visible(self, page: Page) -> bool:
+        """「本日分のミテネは使い切りました」等の表示があるか（＝残 0 の確証）."""
+        try:
+            body = page.inner_text("body") or ""
+        except Exception:
+            return False
+        body = body[:6000]
+        return bool(
+            re.search(r"(ミテネ|きてね|キテネ).{0,6}(使い切|使いきり|使い切りました)", body)
+            or ("本日分" in body and "使い切" in body)
+            or "残り回数は0回" in body
+            or "残り回数：0回" in body
+        )
+
+    def _go_find_members_for_remaining(self, page: Page) -> None:
+        """§5: 残回数は「ミテネできる会員を探す」画面で見る。そこへ遷移する（失敗は握る）."""
+        try:
+            if not self._is_on_pickup_member_page(page) and not self._page_has_send_targets(page):
+                self._open_find_members(page)
+        except Exception as e:
+            logger.info("会員探し画面への遷移に失敗（残回数は現ページで確認）: %s", e)
+
     def _read_send_budget(self, page: Page) -> int:
-        """ミテネ残り回数を取得。budget==0 のみ DailyLimitReached、取得失敗は RuntimeError."""
+        """ミテネ残り回数を取得。budget==0 のみ DailyLimitReached、取得失敗は RuntimeError.
+
+        §5: J1Main ではなく「ミテネできる会員を探す」画面で
+        「ミテネ残り回数：N回」/「本日分のミテネは使い切りました」だけを見る。
+        取得失敗（None）を 0 扱いしない。
+        """
         if self._locked_send_budget is not None:
             logger.info(
                 "【残り回数取得】ロック済みbudgetを使用: %d",
@@ -2209,6 +2569,23 @@ class MiteneSender:
 
         if not self._is_on_pickup_member_page(page):
             self._ensure_deco_home(page)
+
+        # 現ページで数値も「使い切り」も確認できないときだけ会員探し画面へ遷移
+        if not self._mitene_used_up_visible(page) and self._merge_remaining_reads(
+            self._collect_remaining_reads(page)
+        ) is None:
+            self._go_find_members_for_remaining(page)
+
+        if self._mitene_used_up_visible(page):
+            self._log_budget_read(
+                page,
+                dom_snippet=self._collect_remaining_dom_snippet(page),
+                regex_values=[],
+                reads=[("used_up", 0)],
+                final_budget=0,
+            )
+            self._note_remaining_observation("start", 0)
+            raise DailyLimitReached("本日分のミテネを使い切りました。")
 
         dom_snippet = self._collect_remaining_dom_snippet(page)
         reads = self._collect_remaining_reads(page)
@@ -2245,6 +2622,7 @@ class MiteneSender:
             raise self._budget_read_error(f"不正な残り回数: {remaining}")
 
         if remaining == 0:
+            self._perf_budget_zero_retry = True
             retried = self._retry_remaining_on_suspect_zero(page)
             if retried is not None and retried > 0:
                 logger.info("残り回数の再確認で %d 回を取得", retried)
@@ -2276,6 +2654,7 @@ class MiteneSender:
                         reads=reads,
                         final_budget=0,
                     )
+                    self._note_remaining_observation("start", 0)
                     raise DailyLimitReached("ミテネ残り回数が 0 です。")
                 self._log_budget_read(
                     page,
@@ -2297,12 +2676,16 @@ class MiteneSender:
             final_budget=budget,
         )
         self._locked_send_budget = budget
+        # reconciliation: 開始時残回数（cap 前の実表示値）を1回だけ記録
+        self._note_remaining_observation("start", remaining)
         logger.info("送信予定回数（ミテネ残り回数）: %d", budget)
         return budget
 
     def _load_member_send_history(self) -> None:
-        """会員ごとの最終送信日を読み込む."""
+        """会員ごとの最終送信日を読み込む（＋当日送信済みキーの hard guard set を構築）."""
         self._member_last_sent.clear()
+        self._sent_today_keys.clear()
+        _today_iso = date.today().isoformat()
         first_sent: dict[str, date] = {}
         if not self._member_send_log.exists():
             self._no_history_sent_today = 0
@@ -2333,6 +2716,10 @@ class MiteneSender:
                     first = first_sent.get(key)
                     if first is None or sent_on < first:
                         first_sent[key] = sent_on
+                    # 当日成功記録 → hard guard（旧形式・run_id なし行も対象）
+                    if str(raw_date)[:10] == _today_iso:
+                        nk = key if str(key).startswith("comeon-") else member_queue_key(str(key))
+                        self._sent_today_keys.add(nk)
         except OSError as e:
             logger.warning("会員送信履歴の読み込みに失敗: %s", e)
         today = date.today()
@@ -2414,14 +2801,117 @@ class MiteneSender:
     def _record_member_sent(self, key: str) -> None:
         today = date.today()
         self._member_last_sent[key] = today
+        # 当日 hard guard へ即時反映（同一 run の後続フェーズ・再実行での二重送信を防ぐ）
+        self._sent_today_keys.add(self._norm_member_key(key))
         record = {
             "member_key": key,
             "date": today.isoformat(),
             "time": datetime.now().isoformat(timespec="seconds"),
         }
+        # STEP 4: run_id を付与（旧 reader は未知キーを無視するため後方互換）
+        if self._run_id:
+            record["run_id"] = self._run_id
         self.log_dir.mkdir(parents=True, exist_ok=True)
         with self._member_send_log.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._member_sends_written_this_run += 1
+
+    def _note_remaining_observation(self, at: str, value: int | None) -> None:
+        """reconciliation 用: 既存の残回数取得タイミングで観測値を1つ記録するだけ."""
+        self._remaining_observations.append(
+            {
+                "at": at,
+                "value": value if isinstance(value, int) else None,
+                "date": date.today().isoformat(),
+            }
+        )
+        if isinstance(value, int):
+            self._mark_progress(f"remaining_obs:{at}")
+
+    def _finalize_reconciliation(
+        self,
+        *,
+        status: str,
+        cancelled: bool = False,
+        died_midrun: bool = False,
+    ) -> None:
+        """1 invocation につき最終的に1レコードを run_reconciliation.jsonl へ.
+
+        S-F は「S,F とも取得済み・同一日・途中で増加なし・F<=S」のときだけ算出。
+        それ以外は actual_consumed=null（負数を保存しない・§11）。
+        cancel / handled exception でも可能な範囲で残す（storage_state 保存とは無関係）。
+        """
+        if self._reconc_finalized:
+            return
+        self._reconc_finalized = True
+        try:
+            obs = list(self._remaining_observations)
+
+            def _val(at: str) -> int | None:
+                for o in obs:
+                    if o.get("at") == at and isinstance(o.get("value"), int):
+                        return int(o["value"])
+                return None
+
+            s_val = _val("start")
+            f_val = _val("final")
+            if f_val is None:
+                f_val = _val("after_priority")
+            int_vals = [o["value"] for o in obs if isinstance(o.get("value"), int)]
+            quota_inc = False
+            prev: int | None = None
+            for v in int_vals:
+                if prev is not None and v > prev:
+                    quota_inc = True
+                prev = v
+            same_day = len({o.get("date") for o in obs if o.get("date")}) <= 1
+            success_count = sum(
+                1 for k in self._sent_member_keys if str(k).startswith("comeon-")
+            )
+            actual_consumed: int | None = None
+            if (
+                isinstance(s_val, int)
+                and isinstance(f_val, int)
+                and same_day
+                and not quota_inc
+                and f_val <= s_val
+            ):
+                actual_consumed = s_val - f_val
+            rec = {
+                "run_id": self._run_id,
+                "source": "manual",
+                "started_at": getattr(self, "_reconc_started_at", None),
+                "ended_at": datetime.now().isoformat(timespec="seconds"),
+                "status": status,
+                "cancelled": bool(cancelled),
+                "died_midrun": bool(died_midrun),
+                "remaining_start": s_val,
+                "system_success_count": success_count,
+                "member_sends_written": self._member_sends_written_this_run,
+                "remaining_final": f_val,
+                "remaining_observations": obs,
+                "quota_increase_detected": quota_inc,
+                "actual_consumed": actual_consumed,
+                "difference": (
+                    success_count - actual_consumed
+                    if isinstance(actual_consumed, int)
+                    else None
+                ),
+            }
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            with (self.log_dir / "run_reconciliation.jsonl").open(
+                "a", encoding="utf-8"
+            ) as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            logger.info(
+                "run照合: run_id=%s status=%s S=%s C=%s member_sends=%s F=%s "
+                "actual_consumed=%s diff=%s quota_inc=%s",
+                self._run_id, status, s_val, success_count,
+                self._member_sends_written_this_run, f_val,
+                actual_consumed, rec["difference"], quota_inc,
+            )
+        except Exception as e:  # noqa: BLE001 - 監査ログ失敗で本処理を止めない
+            logger.debug("run_reconciliation 書き込み失敗: %s", e)
 
     def _mark_member_sent(self, key: str) -> None:
         was_new = key not in self._member_last_sent
@@ -2448,39 +2938,55 @@ class MiteneSender:
 
     def _ensure_member_list_page(self, page: Page) -> None:
         """送信後、③会員一覧（ミテネを送るが並ぶ画面）に戻す."""
-        step = self._current_step
-        if self._is_member_profile_page(page):
-            if step and self._is_step_profile_page(page, step):
-                self._wait_page_settled(page, quick=True)
-                return
-            logger.info("送信後: プロフィールから一覧へ戻る")
-            if step:
-                self._navigate_to_url_safe(page, step, force_reload=True)
-            else:
-                self._open_visitor_list_direct(page)
-        if self._is_on_comeon_list_page(page) and self._page_has_send_targets(page):
-            return
-        self._wait_page_settled(page, quick=True)
-        if self._page_has_send_targets(page):
-            return
-        for _ in range(2):
-            try:
-                page.go_back()
-                self._wait_page_settled(page)
-                if self._page_has_send_targets(page):
+        _perf_t0 = time.monotonic()
+        self._perf_ensure_went_back = False
+        self._perf_ensure_profile_entry = False
+        try:
+            step = self._current_step
+            if self._is_member_profile_page(page):
+                self._perf_ensure_profile_entry = True
+                if step and self._is_step_profile_page(page, step):
+                    self._wait_page_settled(page, quick=True)
                     return
-            except Exception:
-                break
-        list_url = ""
-        if self._current_list_path:
-            list_url = self._list_url(page, self._current_list_path)
-        if not list_url:
-            list_url = self._pickup_list_url(page)
-        if list_url:
-            logger.info("一覧へ戻る（再読み込み）: %s", list_url)
-            if self._safe_goto(page, list_url):
-                self._dismiss_optional_popups(page)
-                self._wait_for_send_buttons(page, timeout_ms=15000)
+                logger.info("送信後: プロフィールから一覧へ戻る")
+                if step:
+                    self._navigate_to_url_safe(page, step, force_reload=True)
+                else:
+                    self._open_visitor_list_direct(page)
+            if self._is_on_comeon_list_page(page) and self._page_has_send_targets(page):
+                return
+            self._wait_page_settled(page, quick=True)
+            if self._page_has_send_targets(page):
+                return
+            for _ in range(2):
+                try:
+                    page.go_back()
+                    self._perf_ensure_went_back = True
+                    self._wait_page_settled(page)
+                    if self._page_has_send_targets(page):
+                        return
+                except Exception:
+                    break
+            list_url = ""
+            if self._current_list_path:
+                list_url = self._list_url(page, self._current_list_path)
+            if not list_url:
+                list_url = self._pickup_list_url(page)
+            if list_url:
+                logger.info("一覧へ戻る（再読み込み）: %s", list_url)
+                if self._safe_goto(page, list_url):
+                    self._dismiss_optional_popups(page)
+                    self._wait_for_send_buttons(page, timeout_ms=15000)
+        finally:
+            if _PERF_ENABLED:
+                _ems = (time.monotonic() - _perf_t0) * 1000
+                self._perf_add("ensure_list_ms", _ems)
+                _perf_log(
+                    "ensure_list_page",
+                    ms=int(_ems),
+                    went_back=self._perf_ensure_went_back,
+                    profile_detected=self._perf_ensure_profile_entry,
+                )
 
     def _open_find_members(self, page: Page) -> None:
         """②ホームの「ミテネできる会員を探す」→ ③会員一覧."""
@@ -2532,6 +3038,7 @@ class MiteneSender:
 
     def _refresh_send_button_queue(self, page: Page, *, log_scan: bool = True) -> int:
         """送れる会員IDをキュー化（タブ条件・送信済判定を反映）."""
+        _perf_t0 = time.monotonic()
         self._wait_page_settled(page, quick=True)
         keys = self._scan_unsent_member_keys(page)
         step = self._current_step
@@ -2554,6 +3061,17 @@ class MiteneSender:
                 "【%s】「ミテネを送る」送信キュー %d 人",
                 label,
                 len(self._send_button_queue),
+            )
+        if _PERF_ENABLED:
+            _qms = (time.monotonic() - _perf_t0) * 1000
+            self._perf_add("queue_refill_ms", _qms)
+            _perf_log(
+                "queue_refill",
+                tab=_perf_tab_slug(step.tab if step else "一覧"),
+                ms=int(_qms),
+                new_queue_len=len(self._send_button_queue),
+                cache_hit=self._perf_last_parse_cache_hit,
+                log_scan=log_scan,
             )
         return len(self._send_button_queue)
 
@@ -2624,10 +3142,12 @@ class MiteneSender:
 
         deadline = time.monotonic() + LIST_URL_FIX_TIMEOUT_MS / 1000
         attempt = 0
+        self._perf_last_forced_retries = 0
 
         while time.monotonic() < deadline:
             self._check_job_control()
             attempt += 1
+            self._perf_last_forced_retries = attempt
             logger.info(
                 "一覧URLへ直接遷移を試みます (試行 %d) -> %s",
                 attempt,
@@ -2882,9 +3402,16 @@ class MiteneSender:
         return self._navigate_to_url_safe(page, step, force_reload=True)
 
     def _fetch_tab_members(
-        self, page: Page, step: PriorityStep
+        self, page: Page, step: PriorityStep, *, budget_left: int | None = None
     ) -> tuple[list[Member], dict[str, str]]:
-        """window.stop → URL固定 → スクロール → collect_members."""
+        """window.stop → URL固定 → スクロール → collect_members.
+
+        budget_left（残り送信可能回数）が渡され 0 以下の場合、navigation /
+        scroll / parse を一切開始せず空を返す（Phase 2.2E-2）。
+        """
+        if budget_left is not None and budget_left <= 0:
+            logger.info("【%s】budget 満了のため一覧取得をスキップ", step.tab)
+            return [], {}
         self._check_job_control()
         self._invalidate_list_cache()
         self._send_button_queue.clear()
@@ -2892,16 +3419,62 @@ class MiteneSender:
         path = step.list_path or TAB_LIST_PATHS.get(step.tab, "")
         self._current_list_path = path
 
+        _perf_t0 = time.monotonic()
+        _perf_slug = _perf_tab_slug(step.tab)
+        if _PERF_ENABLED:
+            self._perf["list_fetches"] = int(self._perf.get("list_fetches", 0)) + 1
+            self._perf_fetch_counts[_perf_slug] = (
+                self._perf_fetch_counts.get(_perf_slug, 0) + 1
+            )
+        _perf_fetch_no = self._perf_fetch_counts.get(_perf_slug, 1)
+
+        def _perf_emit(res):
+            if _PERF_ENABLED:
+                ms = (time.monotonic() - _perf_t0) * 1000
+                members = res[0] if isinstance(res, tuple) and res else []
+                hsb = sum(
+                    1 for m in members if getattr(m, "has_send_button", False)
+                )
+                if _perf_fetch_no > 1:
+                    self._perf["redundant_fetches"] = (
+                        int(self._perf.get("redundant_fetches", 0)) + 1
+                    )
+                    self._perf_add("redundant_fetch_ms", ms)
+                _perf_log(
+                    "members_collected",
+                    tab=_perf_slug,
+                    fetch_no=_perf_fetch_no,
+                    ms_total=int(ms),
+                    members=len(members),
+                    has_send_button_count=hsb,
+                    filter=step.member_filter or "sendable",
+                )
+            return res
+
+        _perf_nav_t0 = time.monotonic()
         if step.tab == "マイガール":
             opened = self._open_mygirl_via_keep_tab(page)
+            _perf_via_keep = True
         else:
+            _perf_via_keep = False
             opened = self._navigate_to_url_safe(page, step, force_reload=True)
             if not opened:
                 logger.info("【%s】直打ち失敗 → 横タブ切替を試行", step.tab)
                 opened = self._navigate_to_step_list(page, step)
+        if _PERF_ENABLED:
+            _nav_ms = (time.monotonic() - _perf_nav_t0) * 1000
+            self._perf_add("nav_ms", _nav_ms)
+            _perf_log(
+                "nav_done",
+                tab=_perf_slug,
+                ms=int(_nav_ms),
+                via_keep=_perf_via_keep,
+                opened=opened,
+                forced_retries=self._perf_last_forced_retries,
+            )
         if not opened:
             logger.warning("【%s】一覧取得失敗（gid=%s）", step.tab, self._gid())
-            return [], {}
+            return _perf_emit(([], {}))
 
         if self._member_extraction_debug_enabled():
             self._log_tab_switch_debug(page, step.tab)
@@ -2910,7 +3483,7 @@ class MiteneSender:
             logger.warning(
                 "【%s】一覧ページを確認できないため解析を中止", step.tab
             )
-            return [], {}
+            return _perf_emit(([], {}))
 
         pre_count = self._prepare_list_page_before_collect(page, step.tab)
         self._log_list_page_before_parse(
@@ -2922,10 +3495,12 @@ class MiteneSender:
             logger.warning(
                 "【%s】一覧でないため解析を中止: %s", step.tab, page.url
             )
-            return [], {}
+            return _perf_emit(([], {}))
 
-        return self.collect_members(
-            page, step.tab, list_prepared=True, pre_card_count=pre_count
+        return _perf_emit(
+            self.collect_members(
+                page, step.tab, list_prepared=True, pre_card_count=pre_count
+            )
         )
 
     def _raw_cards_to_collected(
@@ -2982,20 +3557,11 @@ class MiteneSender:
         """新規会員（ミテネ履歴に「送信済」なし）かつ送信ボタンあり."""
         return self._apply_step_member_filter(members, history_texts, step)
 
-    def _filter_sendable_members(
-        self,
-        members: list[Member],
-        history_texts: dict[str, str],
-        step: PriorityStep,
-    ) -> list[Member]:
-        """送信ボタンがあり未送信キューに入れられる会員."""
-        return self._apply_step_member_filter(members, history_texts, step)
-
     def _members_to_keys(self, members: list[Member]) -> list[str]:
         keys: list[str] = []
         for member in members:
             key = member_queue_key(member.member_id)
-            if key in self._sent_member_keys or key in self._failed_member_keys:
+            if self._is_send_blocked(key):
                 continue
             if not member.has_send_button:
                 continue
@@ -3003,14 +3569,15 @@ class MiteneSender:
         return keys
 
     def _sort_members_oldest_first(self, members: list[Member]) -> list[Member]:
-        """全会員を送信日古い順（同日ランダム）に並べる."""
+        """履歴あり会員を送信日古い順（同日ランダム）に並べる。本日送信日は除外（§4）."""
+        _today = date.today()
         pool = [
             m
             for m in members
             if m.member_id
             and m.has_send_button
-            and member_queue_key(m.member_id) not in self._sent_member_keys
-            and member_queue_key(m.member_id) not in self._failed_member_keys
+            and m.last_sent != _today
+            and not self._is_send_blocked(m.member_id)
         ]
         if not pool:
             return []
@@ -3038,6 +3605,25 @@ class MiteneSender:
 
     def _member_id_from_queue_key(self, key: str) -> str:
         return key[7:] if key.startswith("comeon-") else (key or "").strip()
+
+    def _norm_member_key(self, member_id_or_key: str) -> str:
+        """member_id / queue key のどちらを渡されても `comeon-<id>` 形式へ正規化."""
+        x = (member_id_or_key or "").strip()
+        return x if x.startswith("comeon-") else member_queue_key(x)
+
+    def _is_send_blocked(self, member_id_or_key: str) -> bool:
+        """この会員を今 CTA 送信してはいけないか（全フェーズ共通の最終ガード）.
+
+        - 同一 run で送信済 / 失敗済 / XHR 不確定
+        - 当日すでに member_sends.jsonl に成功記録がある（cooldown 設定に関係なく hard block・STEP 4 §6）
+        """
+        k = self._norm_member_key(member_id_or_key)
+        return (
+            k in self._sent_member_keys
+            or k in self._failed_member_keys
+            or k in self._uncertain_member_keys
+            or k in self._sent_today_keys
+        )
 
     def _set_send_attempt_outcome(
         self, member_id: str, status: str, reason: str = ""
@@ -3330,65 +3916,234 @@ class MiteneSender:
         """キーリストをキューに載せて残り回数ぶん送信."""
         self._check_job_control()
         tab_name = self._current_step.tab if self._current_step else "一覧"
+
+        _perf_t0 = time.monotonic()
+        _perf_sent0 = sent
+        _perf_filter = (
+            self._current_step.member_filter if self._current_step else ""
+        )
+        if _PERF_ENABLED:
+            self._perf["phases_run"] = int(self._perf.get("phases_run", 0)) + 1
+            _perf_log(
+                "phase_start",
+                phase=label,
+                tab=_perf_tab_slug(tab_name),
+                filter=_perf_filter,
+                budget_left=max(0, budget - sent),
+                queued=len(keys),
+            )
+
+        def _perf_phase_done(final_sent: int) -> int:
+            if _PERF_ENABLED:
+                _pms = (time.monotonic() - _perf_t0) * 1000
+                _perf_log(
+                    "phase_done",
+                    phase=label,
+                    tab=_perf_tab_slug(tab_name),
+                    ms_phase=int(_pms),
+                    sent_this_phase=final_sent - _perf_sent0,
+                )
+            return final_sent
+
         if sent >= budget or not keys:
             if not keys:
                 self._log_pipeline_funnel_queue(tab_name, 0)
-            return sent
+            return _perf_phase_done(sent)
         if members:
             self._log_final_send_targets(members, label)
             if self._member_extraction_debug_enabled():
                 for member in members:
                     self._remember_debug_member_name(member.member_id, member.name)
-        self._send_button_queue = [k for k in keys if k not in self._sent_member_keys]
+        self._send_button_queue = [k for k in keys if not self._is_send_blocked(k)]
         step_limit = min(len(self._send_button_queue), budget - sent)
         self._log_member_extraction_queue_debug(len(self._send_button_queue))
         if step_limit <= 0:
-            return sent
+            return _perf_phase_done(sent)
         self._begin_send_phase_tracking(label, self._send_button_queue[:step_limit])
         logger.info("%s: %d 人へ送信開始", label, step_limit)
         try:
-            return self._send_loop_for_step(
-                page, label, budget, sent, sent_by_step, step_limit
+            return _perf_phase_done(
+                self._send_loop_for_step(
+                    page, label, budget, sent, sent_by_step, step_limit
+                )
             )
         finally:
             self._finish_send_phase_tracking()
 
-    def _send_oldest_first_phases(
+    # §10/§11: ①〜④ ページ単位ストリーミング（全件クロールしない・同一URL再取得しない）
+    STREAM_NO_GROWTH_ROUNDS = 3
+
+    def _stream_send_new_phase(
         self,
         page: Page,
+        step: PriorityStep,
+        label: str,
         budget: int,
         sent: int,
         sent_by_step: dict[str, int],
     ) -> int:
-        """⑥⑦: キープ→マッチ率を各タブ内で送信日古い順に送信."""
-        logger.info("=== フェーズ2: 送信日古い順（⑥⑦）===")
-        for label, tab, list_path in OLDEST_FIRST_PHASE_TABS:
+        """現在DOMのカードを解析 → 新規を送信 → 足りなければ次バッチだけ lazy-load、
+        を必要数（budget）確保 or 一覧末尾までくり返す。全件を読み切ってから送らない。
+
+        - 同一 member_id は一度しか処理しない（seen set）。
+        - ナビゲーションは1回のみ（同一URLを二度クロールしない）。
+        - 本日ミテネ済 / 送信済 / CTA無しは _apply_step_member_filter(new_only) が除外し、
+          さらに送信直前に _send_one_mitene → _cta_anchor_is_safe が最終ガードする。
+        """
+        self._check_job_control()
+        if sent >= budget:
+            return sent
+        self._invalidate_list_cache()
+        self._current_step = step
+        self._current_list_path = step.list_path
+        _perf_t0 = time.monotonic()
+
+        if step.tab == "マイガール":
+            opened = self._open_mygirl_via_keep_tab(page)
+        else:
+            opened = self._navigate_to_url_safe(page, step, force_reload=True)
+            if not opened:
+                opened = self._navigate_to_step_list(page, step)
+        if not opened:
+            logger.warning("【%s】一覧を開けません（gid=%s）", label, self._gid())
+            return sent
+
+        # ④マッチ率など: 描画完了まで adaptive 待機（固定 sleep なし）。
+        # マッチ率は _prepare_list_page_before_collect 内で強化 ready 判定（_wait_match_list_ready）。
+        try:
+            self._prepare_list_page_before_collect(page, step.tab)
+        except Exception:
+            pass
+        _is_match = step.tab == "マッチ率"
+        if _is_match and self._last_list_render_status == "match_load_timeout":
+            logger.warning(
+                "【%s】マッチ率候補が MATCH_LOAD_TIMEOUT。"
+                "この後 0 件でも「候補0件」ではなくロード未完として区別する（送信は継続試行）",
+                label,
+            )
+        if not (
+            self._verify_step_list(page, step)
+            or self._is_on_step_list_page(page, step.list_path)
+            or self._is_member_profile_page(page)
+        ):
+            logger.warning("【%s】一覧を確認できないためスキップ: %s", label, page.url)
+            return sent
+
+        surface = self._member_card_surface(page)
+        parse_arg = {"historyLabel": self.standard.mitene_history_label}
+        py_exclusions: dict[str, int] = {"member_idなし": 0, "不正な型": 0}
+        seen: set[str] = set()
+        no_growth = 0
+        prev_cards = -1
+        sent_this = 0
+
+        try:
+            page.evaluate("window.scrollTo(0, 0)")
+            self._pause_ms(300)
+        except Exception:
+            pass
+
+        for _round in range(LIST_SCROLL_PARSE_MAX_ROUNDS):
+            self._check_job_control()
+            self._check_account_timeout()
             if sent >= budget:
                 break
-            self._check_job_control()
-            step = PriorityStep(
-                tab=tab,
-                member_filter="sent_oldest_first",
-                list_path=list_path,
-            )
-            members, history_texts = self._fetch_tab_members(page, step)
-            filtered = self._apply_step_member_filter(
-                members, history_texts, step
-            )
-            keys = self._members_to_keys(filtered)
-            if not keys:
-                logger.info("%s: 送信対象 0 件", label)
-                continue
-            logger.info("%s: %d 人へ送信開始", label, len(keys))
-            sent = self._send_member_keys_phase(
+            try:
+                batch, _stats = self._evaluate_member_cards(
+                    surface, step.tab, parse_arg, py_exclusions
+                )
+            except Exception as e:
+                logger.warning("【%s】カード解析失敗: %s", label, e)
+                break
+
+            members: list[Member] = []
+            hist: dict[str, str] = {}
+            _seen_before = len(seen)
+            for cd in batch:
+                if not isinstance(cd, dict):
+                    continue
+                mid = str(cd.get("member_id") or "").strip()
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                hist[mid] = str(cd.get("history_text") or "").strip()
+                members.append(
+                    Member(
+                        member_id=mid,
+                        name=str(cd.get("name") or "（名前不明）"),
+                        has_send_button=bool(cd.get("has_send_button")),
+                    )
+                )
+
+            if len(seen) > _seen_before:
+                self._mark_progress("card_growth")  # 新規 unique member/card を取得
+            eligible = self._apply_step_member_filter(members, hist, step, quiet=True)
+            if eligible:
+                self._mark_progress("candidate_discovery")
+            for m in eligible:
+                if sent >= budget:
+                    break
+                key = member_queue_key(m.member_id)
+                if self._is_send_blocked(key):
+                    continue
+                self._send_button_queue = [key]
+                self._debug_member_names[m.member_id] = m.name
+                _ok = self._send_one_mitene(page)
+                self._record_send_attempt_from_last()
+                if _ok:
+                    sent += 1
+                    sent_this += 1
+                    sent_by_step[label] = sent_by_step.get(label, 0) + 1
+                    self._send_done = sent
+                    self._emit_send_progress(sent, budget)
+                    self.human.after_send_pause()
+                    if sent < budget:
+                        self.human.between_members_pause()
+                    surface = self._member_card_surface(page)
+
+            if sent >= budget:
+                break
+
+            # 次バッチだけ lazy-load
+            base_cards = self._count_member_cards_on_surface(surface)
+            base_h = self._get_list_scroll_height(page)
+            try:
+                page.evaluate(
+                    "window.scrollBy(0, Math.min(window.innerHeight * 0.9, 1200))"
+                )
+                self._scroll_list_to_bottom(page)
+            except Exception:
+                pass
+            self._ajax_list_load_wait(
                 page,
-                label,
-                keys,
-                budget,
-                sent,
-                sent_by_step,
-                members=filtered[: len(keys)],
+                surface,
+                base_cards,
+                base_h,
+                no_more_ms=MATCH_AJAX_NO_MORE_MS if _is_match else None,
             )
+            cur_cards = self._count_member_cards_on_surface(surface)
+            if cur_cards <= base_cards and cur_cards <= prev_cards:
+                no_growth += 1
+                if no_growth >= self.STREAM_NO_GROWTH_ROUNDS:
+                    break
+            else:
+                no_growth = 0
+                self._mark_progress("lazy_load_scan_advance")  # 実際にカードが増えた
+            prev_cards = max(prev_cards, cur_cards)
+
+        if _PERF_ENABLED:
+            _perf_log(
+                "stream_phase_done",
+                phase=_perf_tab_slug(step.tab),
+                ms=int((time.monotonic() - _perf_t0) * 1000),
+                sent=sent_this,
+                parsed_unique=len(seen),
+                rounds=_round + 1,
+            )
+        logger.info(
+            "【%s】ストリーミング送信 %d 件（解析ユニーク %d・rounds %d）",
+            label, sent_this, len(seen), _round + 1,
+        )
         return sent
 
     def _execute_phased_send_pipeline(
@@ -3399,170 +4154,310 @@ class MiteneSender:
         sent_by_step: dict[str, int],
         skipped_steps: list[str],
     ) -> int:
-        """フェーズ1（①〜③新規）→ ④マイガール古い順 → ⑤みたよ → ⑥⑦古い順."""
+        """新5フェーズ.
+
+        ①マイガール新規 → ②みたよ新規 → ③キープ新規 → ④マッチ率新規
+        → ⑤マッチ率（送信日が古い順）。
+        各フェーズの送信後、sent >= budget なら後続フェーズへ進まない。
+        """
         self._check_job_control()
         gid = self._gid()
-        logger.info("=== フェーズ1: 新規会員優先巡回（gid=%s）===", gid)
+        logger.info("=== 新規会員優先巡回（gid=%s）===", gid)
 
-        new_matchings: list[Member] = []
+        # budget が既に満了しているなら navigation / crawl を一切開始しない
+        if sent >= budget:
+            return sent
 
-        # ① キープ直打ち → マイガールタブクリック → 新規送信
-        step1 = PriorityStep(
-            tab="マイガール",
-            member_filter="new_only",
-            list_path=MYGIRL_LIST_PATH,
-        )
-        mygirl_members, mygirl_hist = self._fetch_tab_members(page, step1)
-        new_mygirls = self._filter_new_members(
-            mygirl_members, mygirl_hist, step1
-        )
-        if new_mygirls:
-            logger.info("【1】新規マイガール %d 件 → 送信", len(new_mygirls))
-            keys = self._members_to_keys(new_mygirls)
-            sent = self._send_member_keys_phase(
-                page,
-                "①マイガール（新規）",
-                keys,
-                budget,
-                sent,
-                sent_by_step,
-                members=new_mygirls,
+        # ── ①〜④: ページ単位ストリーミング（全件クロールせず、必要数確保で打ち切り）──
+        for label, tab, lp in (
+            ("①マイガール（新規）", "マイガール", MYGIRL_LIST_PATH),
+            ("②みたよ（新規）", "みたよ", "/J10ComeonVisitorList.php"),
+            ("③キープ（新規）", "キープ", KEEP_LIST_PATH),
+            ("④マッチ率（新規）", "マッチ率", "/J10ComeonAiMatchingList.php"),
+        ):
+            if sent >= budget:
+                return sent
+            self._check_job_control()
+            self._check_account_timeout()
+            self._current_phase = label
+            self._mark_progress(f"phase:{label}")
+            step = PriorityStep(tab=tab, member_filter="new_only", list_path=lp)
+            sent = self._stream_send_new_phase(
+                page, step, label, budget, sent, sent_by_step
             )
-        else:
-            logger.info("【1】新規マイガール 0 件")
+            if (
+                tab == "マッチ率"
+                and self._last_list_render_status == "match_load_timeout"
+            ):
+                # 候補0件ではなくロード未完。skipped_steps に理由だけ残す
+                # （run_report 永続化は別タスク）。
+                skipped_steps.append("④マッチ率(新規): MATCH_LOAD_TIMEOUT")
 
         if sent >= budget:
             return sent
 
+        # ── ⑤: マッチ率を送信日が古い順に再送 ──
         self._check_job_control()
-        # ② キープ一覧へ直打ち → 新規送信
-        step2 = PriorityStep(
-            tab="キープ",
-            member_filter="new_only",
-            list_path=KEEP_LIST_PATH,
-        )
-        keep_members, keep_hist = self._fetch_tab_members(page, step2)
-        new_keeps = self._filter_new_members(keep_members, keep_hist, step2)
-        if new_keeps:
-            logger.info("【2】新規キープ %d 件 → 送信", len(new_keeps))
-            keys = self._members_to_keys(new_keeps)
-            sent = self._send_member_keys_phase(
-                page,
-                "②キープ（新規）",
-                keys,
-                budget,
-                sent,
-                sent_by_step,
-                members=new_keeps,
-            )
-        else:
-            logger.info("【2】新規キープ 0 件")
-
-        if sent >= budget:
-            return sent
-
-        self._check_job_control()
-        # ③ マッチ率（新規・残り回数ぶん）
-        step3 = PriorityStep(
+        self._check_account_timeout()
+        self._current_phase = "⑤マッチ率（古い順）"
+        self._mark_progress("phase:⑤マッチ率（古い順）")
+        step5 = PriorityStep(
             tab="マッチ率",
-            member_filter="new_only",
+            member_filter="sent_oldest_first",
             list_path="/J10ComeonAiMatchingList.php",
         )
-        match_members, match_hist = self._fetch_tab_members(page, step3)
-        new_matchings = self._filter_new_members(
-            match_members, match_hist, step3
+        match_members2, match_hist2 = self._fetch_tab_members(
+            page, step5, budget_left=budget - sent
         )
-        self._match_rate_had_new = len(new_matchings) > 0
-        if new_matchings:
-            limit = budget - sent
-            batch = new_matchings[:limit]
-            logger.info(
-                "【3】新規マッチ率 %d 件 → 残り %d 回分送信",
-                len(new_matchings),
-                len(batch),
+        if self._last_list_render_status == "match_load_timeout":
+            logger.warning(
+                "【⑤マッチ率（古い順）】マッチ率候補ロードが MATCH_LOAD_TIMEOUT。"
+                "古い順の全体像が不完全な可能性あり（候補0件とは区別）"
             )
-            keys = self._members_to_keys(batch)
+            skipped_steps.append("⑤マッチ率(古い順): MATCH_LOAD_TIMEOUT")
+        match_ordered = self._apply_step_member_filter(
+            match_members2, match_hist2, step5
+        )
+        if match_ordered:
+            keys = self._members_to_keys(match_ordered)
+            logger.info("【⑤マッチ率（古い順）】%d 件 → 送信", len(keys))
             sent = self._send_member_keys_phase(
                 page,
-                "③マッチ率（新規）",
+                "⑤マッチ率（古い順）",
                 keys,
                 budget,
                 sent,
                 sent_by_step,
-                members=batch,
+                members=match_ordered[: len(keys)],
             )
         else:
-            logger.info("【3】新規マッチ率 0 件")
-
-        if sent >= budget:
-            return sent
-
-        self._check_job_control()
-        # ④ マイガール（送信日古い順）
-        step4 = PriorityStep(
-            tab="マイガール",
-            member_filter="sent_oldest_first",
-            list_path=MYGIRL_LIST_PATH,
-        )
-        mygirl_members2, mygirl_hist2 = self._fetch_tab_members(page, step4)
-        mygirl_ordered = self._apply_step_member_filter(
-            mygirl_members2, mygirl_hist2, step4
-        )
-        if mygirl_ordered:
-            keys = self._members_to_keys(mygirl_ordered)
-            logger.info("【4】マイガール（古い順） %d 件 → 送信", len(keys))
-            sent = self._send_member_keys_phase(
-                page,
-                "④マイガール（古い順）",
-                keys,
-                budget,
-                sent,
-                sent_by_step,
-                members=mygirl_ordered[: len(keys)],
-            )
-        else:
-            logger.info("【4】マイガール（古い順）送信対象 0 件")
-
-        if sent >= budget:
-            return sent
-
-        self._check_job_control()
-        # ⑤ みたよ（③で新規マッチ率0件のときのみ）
-        step5 = PriorityStep(
-            tab="みたよ",
-            member_filter="sendable",
-            list_path="/J10ComeonVisitorList.php",
-        )
-        visitor_members, visitor_hist = self._fetch_tab_members(page, step5)
-        if not new_matchings:
-            sendable = self._filter_sendable_members(
-                visitor_members, visitor_hist, step5
-            )
-            if sendable:
-                logger.info("【5】みたよ %d 件 → 送信", len(sendable))
-                keys = self._members_to_keys(sendable)
-                sent = self._send_member_keys_phase(
-                    page,
-                    "⑤みたよ",
-                    keys,
-                    budget,
-                    sent,
-                    sent_by_step,
-                    members=sendable,
-                )
-            else:
-                logger.info("【5】みたよ送信対象 0 件")
-        else:
-            logger.info("【SKIP】マッチ率に新規あり → みたよはスキップ")
-
-        if sent >= budget:
-            return sent
-
-        sent = self._send_oldest_first_phases(
-            page, budget, sent, sent_by_step
-        )
+            logger.info("【⑤マッチ率（古い順）】送信対象 0 件")
 
         logger.info("本日の送信巡回ルート完了（送信 %d / 目標 %d）", sent, budget)
+        return sent
+
+    # ── ①〜⑤後の残回数再取得 / ランダム追加消化 / 実行レポート確定 ──
+
+    RANDOM_CONSUME_EXTRA_ATTEMPTS = 5
+    RANDOM_CONSUME_MAX_ATTEMPTS = 20
+
+    def _read_remaining_after_phases(self, page: Page) -> int | None:
+        """フェーズ後の残回数を1回だけ取得する（例外を投げない）.
+
+        §5: 「ミテネできる会員を探す」画面で確認する。
+        戻り値: int（0 含む）= confident に取得できた値 / None = 取得失敗。
+        「使い切りました」表示は 0 として返す（None と混同しない）。
+        """
+        self._check_job_control()
+        try:
+            if not self._is_on_pickup_member_page(page):
+                self._ensure_deco_home(page)
+        except Exception:
+            pass
+        try:
+            val = self._parse_remaining_count(page)
+        except Exception:
+            val = None
+        if val is None and not self._mitene_used_up_visible(page):
+            self._go_find_members_for_remaining(page)
+            try:
+                val = self._parse_remaining_count(page)
+            except Exception:
+                val = None
+        if val is None and self._mitene_used_up_visible(page):
+            return 0
+        return val
+
+    def _collect_random_safe_candidates(self, page: Page) -> list[str]:
+        """ランダム追加消化用の安全候補キー（送信ボタンあり・今回未送信/未失敗）.
+
+        今回 streaming は実装しないため、既存 fetch 設計の範囲でマッチ率一覧
+        （最大母数）を1回取得して `sendable` フィルタを掛けるだけに留める。
+        """
+        step = PriorityStep(
+            tab="マッチ率",
+            member_filter="sendable",
+            list_path="/J10ComeonAiMatchingList.php",
+        )
+        try:
+            members, hist = self._fetch_tab_members(page, step)
+        except Exception:
+            return []
+        filtered = self._apply_step_member_filter(members, hist, step, quiet=True)
+        keys: list[str] = []
+        seen: set[str] = set()
+        for m in filtered:
+            if not getattr(m, "member_id", ""):
+                continue
+            k = member_queue_key(m.member_id)
+            if k in seen:
+                continue
+            if self._is_send_blocked(k):
+                continue
+            seen.add(k)
+            keys.append(k)
+        return keys
+
+    def _execute_random_consume(
+        self,
+        page: Page,
+        budget: int,
+        sent: int,
+        sent_by_step: dict[str, int],
+        remaining_left: int,
+    ) -> tuple[int, str]:
+        """①〜⑤後に残った回数を安全候補からランダムに消化する.
+
+        戻り値: (sent, consume_status)
+          consume_status ∈ {"consumed", "partial", "no_safe_candidate"}
+        """
+        self._check_job_control()
+        need = max(0, int(remaining_left))
+        if need <= 0:
+            return sent, "consumed"
+        max_attempts = min(
+            self.RANDOM_CONSUME_MAX_ATTEMPTS,
+            need + self.RANDOM_CONSUME_EXTRA_ATTEMPTS,
+        )
+        logger.info(
+            "=== ランダム追加消化（残り %d 回 / 最大 %d 試行）===",
+            need,
+            max_attempts,
+        )
+        candidates = self._collect_random_safe_candidates(page)
+        candidates = [k for k in candidates if not self._is_send_blocked(k)]
+        if not candidates:
+            logger.info("ランダム追加消化: 安全な送信候補が見つかりません")
+            return sent, "no_safe_candidate"
+        random.shuffle(candidates)
+        step = PriorityStep(
+            tab="マッチ率",
+            member_filter="sendable",
+            list_path="/J10ComeonAiMatchingList.php",
+        )
+        self._current_step = step
+        self._current_list_path = step.list_path
+        label = "ランダム追加消化"
+        sent_by_step.setdefault(label, 0)
+        attempts = 0
+        consumed = 0
+        for key in candidates:
+            if sent >= budget or consumed >= need or attempts >= max_attempts:
+                break
+            if self._is_send_blocked(key):
+                continue
+            self._check_job_control()
+            self._check_account_timeout()
+            attempts += 1
+            self._send_button_queue = [key]
+            if self._send_one_mitene(page):
+                sent += 1
+                consumed += 1
+                self._send_done = sent
+                sent_by_step[label] += 1
+                self._emit_send_progress(sent, budget)
+                self.human.after_send_pause()
+                if sent < budget and consumed < need:
+                    self.human.between_members_pause()
+        logger.info(
+            "ランダム追加消化: %d 件送信（%d 試行 / 目標 %d）",
+            consumed,
+            attempts,
+            need,
+        )
+        if consumed >= need:
+            return sent, "consumed"
+        return sent, ("partial" if consumed > 0 else "no_safe_candidate")
+
+    def _finalize_phased_run(
+        self,
+        page: Page,
+        budget: int,
+        sent: int,
+        sent_by_step: dict[str, int],
+        skipped_steps: list[str],
+    ) -> int:
+        """①〜⑤（＋ランダム追加消化）後の残回数確認とレポート確定.
+
+        status_hint:
+          completed              … 残回数を 0 と confident に確認できた
+          completed_with_remaining … 残回数 > 0 だが安全な送信候補が無い
+          budget_read_failed     … 残回数を最後まで取得できなかった
+          sent                   … 上記いずれでもなく送信実績あり
+        """
+        self._check_account_timeout()
+        self._current_phase = "reconciliation"
+        remaining_after_priority = self._read_remaining_after_phases(page)
+        self._note_remaining_observation("after_priority", remaining_after_priority)
+        logger.info(
+            "①〜⑤終了時点の残り回数: %s",
+            remaining_after_priority
+            if remaining_after_priority is not None
+            else "取得できず",
+        )
+
+        consume_status = "priority_only"
+        remaining_final = remaining_after_priority
+        if remaining_after_priority is not None and remaining_after_priority > 0:
+            sent, consume_status = self._execute_random_consume(
+                page, budget, sent, sent_by_step, remaining_after_priority
+            )
+            remaining_final = self._read_remaining_after_phases(page)
+            logger.info(
+                "ランダム追加消化後の残り回数: %s",
+                remaining_final if remaining_final is not None else "取得できず",
+            )
+        self._note_remaining_observation("final", remaining_final)
+
+        # confident に読めた最終残回数（final を優先、無ければ priority 後の値）
+        eff_remaining = (
+            remaining_final if remaining_final is not None else remaining_after_priority
+        )
+        if eff_remaining == 0:
+            status_hint = "completed"
+            note = f"{sent} 件送信し、残り回数を使い切りました。"
+        elif isinstance(eff_remaining, int) and eff_remaining > 0:
+            status_hint = "completed_with_remaining"
+            note = (
+                f"{sent} 件送信。残り {eff_remaining} 回は"
+                "安全に送信できる対象が見つからないため終了しました。"
+            )
+        elif sent > 0:
+            # 送信は成立したが、終了後の残回数を再確認できなかった
+            # （0 と取得失敗を混同しない・ERROR にはしない）
+            status_hint = "sent"
+            note = f"{sent} 回送信しました。（終了後の残り回数は未確認）"
+        else:
+            # 1件も送れず、残回数も最後まで confident に読めなかった → ERROR 候補
+            status_hint = "budget_read_failed"
+            note = (
+                f"{BUDGET_READ_FAILED_PREFIX}"
+                "（①〜⑤終了後の残り回数を確認できませんでした）"
+            )
+
+        self._last_run_report = {
+            "budget": budget,
+            "sent": sent,
+            "sent_by_step": sent_by_step,
+            "skipped_steps": skipped_steps,
+            "note": note,
+            "status_hint": status_hint,
+            "remaining_after_priority": remaining_after_priority,
+            "remaining_final": remaining_final,
+            "consume_status": consume_status,
+        }
+        for lbl, count in sent_by_step.items():
+            if count:
+                logger.info("[%s]: %d 件", lbl, count)
+        logger.info(
+            "合計 %d 件送信（目標 %d 回・status=%s・残り最終 %s）",
+            sent,
+            budget,
+            status_hint,
+            remaining_final if remaining_final is not None else "不明",
+        )
+        self._log_run_send_reconciliation()
+        self._log_debug_run_summary()
         return sent
 
     def _navigate_to_step_list(self, page: Page, step: PriorityStep) -> bool:
@@ -3963,12 +4858,24 @@ class MiteneSender:
         return base
 
     def zero_send_message(self) -> str:
-        r = self._last_run_report
+        r = self._last_run_report or {}
+        hint = r.get("status_hint")
+        note = str(r.get("note") or "").strip()
+        if hint == "completed":
+            return note or "残り回数を使い切りました。"
+        if hint == "completed_with_remaining":
+            rem = r.get("remaining_final")
+            base = (
+                f"完了（送信可能な対象なし・残り{rem}件）"
+                if isinstance(rem, int) and rem > 0
+                else "完了（送信可能な対象なし）"
+            )
+            return f"{base} {note}".strip()
         parts: list[str] = ["送信0件（ミテネ回数は減りません）。"]
         if r.get("budget"):
             parts.append(f"残り回数: {r['budget']}回")
-        if r.get("note"):
-            parts.append(r["note"])
+        if note:
+            parts.append(note)
         return " ".join(parts)
 
     def _send_loop_for_step(
@@ -3996,6 +4903,7 @@ class MiteneSender:
         max_failed = max(step_limit * 3, 15)
         while sent < initial_budget and step_sent < step_limit:
             self._check_job_control()
+            self._check_account_timeout()
             if failed_attempts >= max_failed:
                 logger.warning(
                     "%s: 失敗が %d 回に達したため中断",
@@ -4016,7 +4924,36 @@ class MiteneSender:
                     continue
                 stall = 0
                 continue
-            if not self._send_one_mitene(page):
+            _perf_send_t0 = time.monotonic()
+            _perf_pr0 = self._perf_parse_remaining_calls
+            if _PERF_ENABLED:
+                _perf_log(
+                    "send_start",
+                    tab=_perf_tab_slug(
+                        self._current_step.tab if self._current_step else "一覧"
+                    ),
+                    queue=len(self._send_button_queue),
+                )
+            _perf_send_ok = self._send_one_mitene(page)
+            if _PERF_ENABLED:
+                _sms = (time.monotonic() - _perf_send_t0) * 1000
+                self._perf_add("send_ms", _sms)
+                _perf_oc = self._last_send_attempt or {}
+                _perf_log(
+                    "send_done",
+                    ms=int(_sms),
+                    ok=bool(_perf_send_ok),
+                    fail_reason=(
+                        "" if _perf_send_ok else (_perf_oc.get("reason") or "")
+                    ),
+                    confirm_loops=self._perf_confirm_loops,
+                    remaining_before=self._perf_send_rb,
+                    remaining_after=self._perf_send_ra,
+                    parse_remaining_calls=(
+                        self._perf_parse_remaining_calls - _perf_pr0
+                    ),
+                )
+            if not _perf_send_ok:
                 self._record_send_attempt_from_last()
                 failed_attempts += 1
                 stall += 1
@@ -4088,13 +5025,78 @@ class MiteneSender:
         return 3500 if self.human.fast_send else 5000
 
     def _kitene_button_locator(self, page: Page, member_id: str) -> Locator:
+        """送信CTAの「クリックすべき inner <a>」だけを返す（wrapper <div> は返さない）.
+
+        実DOM:
+          <div class="kitene_send_btn js-kitene_send_btn js-regist_comeon_{id} active">
+            <object><a class="kitene_send_btn__text_wrapper"
+                       onclick="registComeon({id})">…</a></object></div>
+        wrapper <div>（`.js-regist_comeon_{id}` 単独）は onclick を持たないため、
+        セレクタ union + `.first`（= DOM 文書順）で wrapper が先に解決されると
+        クリックしても registComeon が発火しない。ここでは `a` 要素のみを対象にし、
+        `.first` が必ず inner <a> になるようにする。
+        """
+        mid = str(member_id).strip()
         return page.locator(
-            f".js-regist_comeon_{member_id} a, "
-            f".js-regist_comeon_{member_id}, "
-            f".u_{member_id} .kitene_send_btn a, "
-            f".u_{member_id} a.kitene_send_btn__text_wrapper, "
-            f'a[onclick*="registComeon({member_id})"]'
+            ", ".join(
+                [
+                    f'a.kitene_send_btn__text_wrapper[onclick*="registComeon({mid})"]',
+                    f'a[onclick*="registComeon({mid})"]',
+                    f".js-regist_comeon_{mid} a.kitene_send_btn__text_wrapper",
+                    f'.js-regist_comeon_{mid} a[onclick*="registComeon"]',
+                    f".u_{mid} a.kitene_send_btn__text_wrapper",
+                    f".u_{mid} .kitene_send_btn a",
+                ]
+            )
         )
+
+    def _cta_anchor_is_safe(self, anchor: Locator, member_id: str) -> bool:
+        """クリック直前の安全確認: inner <a>・onclick が対象会員の registComeon・
+        送信済/zumi でない・可視。1件でも不明なら False（SKIP）."""
+        mid = str(member_id).strip()
+        try:
+            info = anchor.evaluate(
+                """(node, mid) => {
+                    if (!node || (node.tagName || '').toLowerCase() !== 'a') return null;
+                    const oc = (node.getAttribute('onclick') || '').replace(/\\s+/g, '');
+                    const wrap = node.closest('[class*="js-regist_comeon_"]')
+                        || node.closest('.kitene_send_btn');
+                    const wc = wrap ? String(wrap.className || '') : '';
+                    const zumi = wrap && wrap.querySelector('.kitene_send_zumi_btn');
+                    let zumiOn = false;
+                    if (zumi) {
+                        const zs = getComputedStyle(zumi);
+                        zumiOn = zs.display !== 'none' && zs.visibility !== 'hidden'
+                            && !!zumi.offsetParent;
+                    }
+                    const t = (node.innerText || '').replace(/\\s+/g, ' ').trim();
+                    return {
+                        onclick: oc, wrapCls: wc, zumiOn,
+                        text: t, visible: !!node.offsetParent,
+                        wrapHasMid: wc.indexOf('js-regist_comeon_' + mid) >= 0,
+                    };
+                }""",
+                mid,
+            )
+        except Exception:
+            return False
+        if not isinstance(info, dict):
+            return False
+        oc = (info.get("onclick") or "").lower()
+        if f"registcomeon({mid})".lower() not in oc:
+            return False
+        if info.get("zumiOn"):
+            return False
+        if "kitene_send_zumi_btn" in (info.get("wrapCls") or ""):
+            return False
+        txt = info.get("text") or ""
+        if "送信済" in txt:
+            return False
+        if txt and "ミテネ" not in txt:
+            return False
+        if not info.get("visible"):
+            return False
+        return True
 
     def _parse_history_date(self, history_text: str) -> date | None:
         """ミテネ履歴から送信日を抽出（古い順ソート用）."""
@@ -4174,8 +5176,8 @@ class MiteneSender:
         logger.info("=== ミテネ送信パイプライン ===")
         logger.info("対象抽出: collect_members → _apply_step_member_filter")
         logger.info(
-            "送信順決定: ①②③新規 → ④マイガール古い順 → ⑤みたよ"
-            " → ⑥⑦キープ・マッチ率古い順"
+            "送信順決定: ①マイガール新規 → ②みたよ新規 → ③キープ新規"
+            " → ④マッチ率新規 → ⑤マッチ率（古い順）"
         )
         logger.info(
             "新規会員判定: div.kitene_question > span.question「ミテネ履歴」"
@@ -4198,9 +5200,96 @@ class MiteneSender:
             "on",
         )
 
-    def _ajax_list_load_wait(self) -> None:
-        """Ajax 遅延読込待ち（scrollHeight だけでは足りないため 2〜3 秒）."""
-        self._pause_ms(random.randint(*LIST_AJAX_LOAD_WAIT_MS))
+    def _read_cards_height(self, page: Page, surface: Any) -> tuple[int, int]:
+        """既存 MEMBER_CARD_COUNT_JS ＋ _get_list_scroll_height の式を 1 evaluate で取得."""
+        raw = surface.evaluate(MEMBER_CARD_COUNT_HEIGHT_JS)
+        return int(raw[0]), int(raw[1])
+
+    def _ajax_list_load_wait(
+        self,
+        page: Page | None = None,
+        surface: Any = None,
+        base_cards: int | None = None,
+        base_height: int | None = None,
+        *,
+        no_more_ms: int | None = None,
+    ) -> None:
+        """スクロール後のカード追加ロードを待つ.
+
+        no_more_ms: 「増加なしで完了」と判定するまでの時間（既定 LIST_AJAX_NO_MORE_MS=1200）。
+        マッチ率のみ MATCH_AJAX_NO_MORE_MS を渡して延長する。増加が確認できたら
+        従来どおり LIST_AJAX_SETTLE_MS で即完了（adaptive 構造は不変）。
+
+        引数が渡された場合（_scroll_parse_merge_list 経由）は adaptive wait:
+        card_count / scrollHeight の増加を ~100ms 間隔で監視し、
+        最後の増加から LIST_AJAX_SETTLE_MS 無変化なら完了。
+        カードが増えないまま LIST_AJAX_NO_MORE_MS 経過なら「追加なし」で完了。
+        いずれも LIST_AJAX_ADAPTIVE_CAP_MS を上限とする。
+        監視情報が無い旧呼び出し（_scroll_member_list_to_end 等）は従来の固定 sleep。
+        """
+        if page is None or surface is None or base_cards is None or base_height is None:
+            self._pause_ms(random.randint(*LIST_AJAX_LOAD_WAIT_MS))
+            return
+
+        t0 = time.monotonic()
+        cur_cards, cur_height = base_cards, base_height
+        changed = False
+        last_change = t0
+        polls = 0
+        reason = "cap"
+        read_errors = 0
+        no_more = (
+            no_more_ms if no_more_ms is not None else LIST_AJAX_NO_MORE_MS
+        )
+        cap_ms = max(LIST_AJAX_ADAPTIVE_CAP_MS, no_more + 300)
+
+        while (time.monotonic() - t0) * 1000.0 < cap_ms:
+            self._check_job_control()  # JobCancelled はそのまま伝播させる
+            polls += 1
+            try:
+                c, h = self._read_cards_height(page, surface)
+            except Exception:
+                read_errors += 1
+                if read_errors >= 3:
+                    # DOM 監視が続けて失敗 → 安全側で従来相当の待機に切替
+                    reason = "read_error_fallback"
+                    rem_ms = LIST_AJAX_LOAD_WAIT_MS[1] - (time.monotonic() - t0) * 1000.0
+                    if rem_ms > 0:
+                        self._pause_ms(int(rem_ms))
+                    break
+                self._pause_ms(LIST_AJAX_POLL_MS)
+                continue
+            read_errors = 0
+
+            if c > cur_cards or h > cur_height + 200:
+                changed = True
+                last_change = time.monotonic()
+                cur_cards = max(cur_cards, c)
+                cur_height = max(cur_height, h)
+
+            if changed and (time.monotonic() - last_change) * 1000.0 >= LIST_AJAX_SETTLE_MS:
+                reason = "cards_changed_settled"
+                break
+            if (
+                not changed
+                and (time.monotonic() - t0) * 1000.0 >= no_more
+            ):
+                reason = "no_more"
+                break
+            self._pause_ms(LIST_AJAX_POLL_MS)
+
+        if _PERF_ENABLED:
+            _perf_log(
+                "ajax_adaptive_wait",
+                surface=("page" if surface is page else "frame"),
+                ms=int((time.monotonic() - t0) * 1000),
+                polls=polls,
+                reason=reason,
+                before_cards=base_cards,
+                after_cards=cur_cards,
+                before_height=base_height,
+                after_height=cur_height,
+            )
 
     def _scroll_list_to_bottom(self, page: Page) -> None:
         page.evaluate(
@@ -4394,6 +5483,10 @@ class MiteneSender:
             return "本実行で送信済"
         if key in self._failed_member_keys:
             return "送信失敗"
+        if key in self._uncertain_member_keys:
+            return "XHR不確定（同一run再送しない）"
+        if key in self._sent_today_keys:
+            return "本日送信済（member_sends）"
         if not member.has_send_button:
             return "送信ボタンなし"
         if mode == "new_only" and member.sent_history:
@@ -4555,6 +5648,7 @@ class MiteneSender:
         500ms ごとに会員カード数・ローディング状態を確認（最大8秒）。
         カード1件以上で終了。タイムアウトしても続行。
         """
+        _perf_t0 = time.monotonic()
         deadline = time.monotonic() + LIST_RENDER_WAIT_MAX_MS / 1000
         card_n = 0
         poll = 0
@@ -4572,6 +5666,17 @@ class MiteneSender:
                     poll * LIST_RENDER_POLL_MS,
                     poll,
                 )
+                if _PERF_ENABLED:
+                    _rms = (time.monotonic() - _perf_t0) * 1000
+                    self._perf_add("render_wait_ms", _rms)
+                    _perf_log(
+                        "list_render_wait_done",
+                        tab=_perf_tab_slug(tab_name),
+                        ms=int(_rms),
+                        cards=card_n,
+                        timed_out=False,
+                        polls=poll,
+                    )
                 return card_n, True
             if not loading and poll > 1:
                 logger.debug(
@@ -4588,6 +5693,17 @@ class MiteneSender:
             LIST_RENDER_WAIT_MAX_MS // 1000,
             card_n,
         )
+        if _PERF_ENABLED:
+            _rms = (time.monotonic() - _perf_t0) * 1000
+            self._perf_add("render_wait_ms", _rms)
+            _perf_log(
+                "list_render_wait_done",
+                tab=_perf_tab_slug(tab_name),
+                ms=int(_rms),
+                cards=card_n,
+                timed_out=True,
+                polls=poll,
+            )
         return card_n, False
 
     def _log_list_page_before_parse(
@@ -4639,16 +5755,135 @@ class MiteneSender:
         except Exception as exc:
             logger.warning("【%s】HTML保存失敗: %s", tab_name, exc)
 
+    def _wait_match_list_ready(self, page: Page, tab_name: str) -> tuple[int, bool]:
+        """マッチ率（AiMatching）専用の初期一覧 ready 待機（match-adaptive-wait）.
+
+        CityHeaven 側が遷移後に候補を段階生成するため:
+          - loading/spinner が可視の間は ready にしない（card が1件見えても待つ）
+          - loading 消失 ＋ card 数が MATCH_LIST_STABLE_POLLS 回連続で無変化 → ready
+          - loading 消失 ＋ card 0 が同条件で安定 → 候補0件（empty_stable。timeout ではない）
+          - 上限（MATCH_LIST_RENDER_WAIT_MAX_MS）到達で loading 継続 / card 未確定
+            → MATCH_LOAD_TIMEOUT（候補0件と区別）
+        poll は既存 LIST_RENDER_POLL_MS を流用。busy loop なし。
+        戻り値 (card_n, ok)：ok=False は MATCH_LOAD_TIMEOUT のときのみ。
+        self._last_list_render_status に "ready" / "empty_stable" / "match_load_timeout" を残す。
+        """
+        _perf_t0 = time.monotonic()
+        deadline = _perf_t0 + MATCH_LIST_RENDER_WAIT_MAX_MS / 1000
+        card_n = 0
+        prev_card_n = -1
+        stable = 0
+        saw_loading = False
+        poll = 0
+
+        while time.monotonic() < deadline:
+            self._check_job_control()
+            poll += 1
+            card_n = self._count_list_cards_on_page(page)
+            loading = self._is_list_loading_visible(page)
+
+            if loading:
+                saw_loading = True
+                stable = 0
+                prev_card_n = card_n
+                self._pause_ms(LIST_RENDER_POLL_MS)
+                continue
+
+            # loading == False（正式 gate）
+            if card_n == prev_card_n:
+                stable += 1
+            else:
+                stable = 0
+            prev_card_n = card_n
+
+            if stable >= MATCH_LIST_STABLE_POLLS:
+                status = "ready" if card_n >= 1 else "empty_stable"
+                self._last_list_render_status = status
+                logger.info(
+                    "【%s】マッチ率一覧 %s: カード %d件・loading完了・"
+                    "%d poll連続で無変化（%d ms・poll %d）",
+                    tab_name,
+                    "ready" if status == "ready" else "候補0件",
+                    card_n,
+                    MATCH_LIST_STABLE_POLLS,
+                    int((time.monotonic() - _perf_t0) * 1000),
+                    poll,
+                )
+                if _PERF_ENABLED:
+                    _rms = (time.monotonic() - _perf_t0) * 1000
+                    self._perf_add("render_wait_ms", _rms)
+                    _perf_log(
+                        "match_list_ready",
+                        tab=_perf_tab_slug(tab_name),
+                        ms=int(_rms),
+                        cards=card_n,
+                        status=status,
+                        polls=poll,
+                    )
+                return card_n, True
+
+            self._pause_ms(LIST_RENDER_POLL_MS)
+
+        # ---- 上限到達 ----
+        still_loading = self._is_list_loading_visible(page)
+        if still_loading or (saw_loading and card_n == 0):
+            self._last_list_render_status = "match_load_timeout"
+            logger.warning(
+                "【%s】マッチ率候補ロードが上限内に完了せず"
+                "（MATCH_LOAD_TIMEOUT・%d秒・loading=%s・最終カード数=%d）"
+                "— 候補0件とは区別する",
+                tab_name,
+                MATCH_LIST_RENDER_WAIT_MAX_MS // 1000,
+                still_loading,
+                card_n,
+            )
+            ok = False
+        elif card_n == 0:
+            self._last_list_render_status = "empty_stable"
+            logger.info(
+                "【%s】マッチ率一覧: loading完了・カード0件（上限到達・%d秒）→ 候補0件",
+                tab_name,
+                MATCH_LIST_RENDER_WAIT_MAX_MS // 1000,
+            )
+            ok = True
+        else:
+            self._last_list_render_status = "ready"
+            logger.info(
+                "【%s】マッチ率一覧: カード %d件・loading完了（上限到達だが採用）",
+                tab_name,
+                card_n,
+            )
+            ok = True
+        if _PERF_ENABLED:
+            _rms = (time.monotonic() - _perf_t0) * 1000
+            self._perf_add("render_wait_ms", _rms)
+            _perf_log(
+                "match_list_ready",
+                tab=_perf_tab_slug(tab_name),
+                ms=int(_rms),
+                cards=card_n,
+                status=self._last_list_render_status,
+                polls=poll,
+            )
+        return card_n, ok
+
     def _prepare_list_page_before_collect(
         self, page: Page, tab_name: str
     ) -> int:
         """
         DOM解析・スクロール前の全タブ共通準備。
         プロフィール→一覧 / 一覧描画ポーリング待機。
+        マッチ率のときだけ強化した ready 判定（_wait_match_list_ready）を使う。
+        戻り値は従来どおり card 数（int）。timeout / 候補0件 の区別は
+        self._last_list_render_status に残す。
         """
         logger.info("【%s】一覧準備開始", tab_name)
         self._ensure_list_from_profile(page, tab_name)
-        card_n, _ = self._poll_wait_for_list_render(page, tab_name)
+        if tab_name == "マッチ率":
+            card_n, _ok = self._wait_match_list_ready(page, tab_name)
+        else:
+            card_n, ready = self._poll_wait_for_list_render(page, tab_name)
+            self._last_list_render_status = "ready" if ready else "timeout"
         return card_n
 
     def _log_pipeline_funnel_stage(
@@ -4683,8 +5918,15 @@ class MiteneSender:
         return "一覧"
 
     def _history_text_is_sent(self, history_text: str) -> bool:
-        """一覧DOMのミテネ履歴テキストから送信済みか判定（filter専用）."""
-        return not is_new_member_from_history((history_text or "").strip())
+        """一覧DOMのミテネ履歴テキストから送信済みか判定（filter専用）.
+
+        新規 = ミテネ履歴（日付表示）が存在しない。よって
+        「送信済」の語がある / 日付を抽出できる のどちらかなら「送信済（＝新規でない）」。
+        """
+        text = (history_text or "").strip()
+        if not is_new_member_from_history(text):
+            return True
+        return self._parse_history_date(text) is not None
 
     def _enrich_member_sent_fields(
         self, member: Member, history_text: str
@@ -4770,10 +6012,21 @@ class MiteneSender:
         summary = getattr(self, "_last_list_fetch_summary", {}) or {}
         post_count = int(summary.get("final_card_count") or len(raw_cards))
 
-        if post_count == 0 and not raw_cards:
+        # マッチ率で MATCH_LOAD_TIMEOUT かつ収集が極端に少数のときも 1 回だけ再確認する
+        # （候補生成が段階的で partial のまま stable 終了したケース・§10。最大1回・無限retryなし）。
+        _match_load_timeout = (
+            tab_name == "マッチ率"
+            and getattr(self, "_last_list_render_status", "") == "match_load_timeout"
+        )
+        if (post_count == 0 and not raw_cards) or (
+            _match_load_timeout and post_count <= MATCH_MIN_STABLE_CARDS
+        ):
+            _perf_zr_t0 = time.monotonic()
             logger.info(
-                "【%s】スクロール後0件 → %d秒追加待機して再取得",
+                "【%s】スクロール後 %d 件（%s）→ %d秒追加待機して再取得（最大1回）",
                 tab_name,
+                post_count,
+                "MATCH_LOAD_TIMEOUT" if _match_load_timeout else "0件",
                 LIST_ZERO_RETRY_WAIT_MS // 1000,
             )
             self._pause_ms(LIST_ZERO_RETRY_WAIT_MS)
@@ -4787,6 +6040,15 @@ class MiteneSender:
                 summary = getattr(self, "_last_list_fetch_summary", {}) or {}
                 post_count = int(
                     summary.get("final_card_count") or len(raw_cards)
+                )
+            if _PERF_ENABLED:
+                _zms = (time.monotonic() - _perf_zr_t0) * 1000
+                self._perf_add("zero_retry_ms", _zms)
+                _perf_log(
+                    "zero_retry",
+                    tab=_perf_tab_slug(tab_name),
+                    ms=int(_zms),
+                    recovered=bool(raw_cards),
                 )
 
         if post_count == 0 and not raw_cards:
@@ -5064,10 +6326,13 @@ class MiteneSender:
         self,
         surface: Any,
         tab_name: str,
-        parse_arg: dict[str, str],
+        parse_arg: dict[str, Any],
         py_exclusions: dict[str, int],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        raw = surface.evaluate(MEMBER_CARD_PARSE_JS, parse_arg)
+        # マッチ率カードだけ readHistory の Path 2 fallback を無効化する（history 誤分類対策）。
+        # 他タブは matchStrict=False で従来どおり。
+        arg = {**parse_arg, "matchStrict": tab_name == "マッチ率"}
+        raw = surface.evaluate(MEMBER_CARD_PARSE_JS, arg)
         rows, stats = _extract_card_parse_result(raw)
         if not rows and raw is not None:
             if not (
@@ -5094,6 +6359,9 @@ class MiteneSender:
         スクロール → Ajax待ち → DOM解析 → member_idマージ を終了条件まで繰り返す。
         終了: scrollHeight / カード数 / uniqueMemberIds が連続で変化しないこと。
         """
+        _perf_t0 = time.monotonic()
+        _perf_slug = _perf_tab_slug(tab_name)
+        _perf_exit = "incomplete"
         merged: dict[str, dict[str, Any]] = {}
         agg_stats: dict[str, Any] = {}
         py_exclusions: dict[str, int] = {
@@ -5124,8 +6392,12 @@ class MiteneSender:
 
         for round_i in range(LIST_SCROLL_PARSE_MAX_ROUNDS):
             self._check_job_control()
+            self._check_account_timeout()
             round_no = round_i + 1
+            _perf_round_t0 = time.monotonic()
 
+            _base_cards = self._count_member_cards_on_surface(surface)
+            _base_height = self._get_list_scroll_height(page)
             try:
                 page.evaluate(
                     "window.scrollBy(0, Math.min(window.innerHeight * 0.75, 800))"
@@ -5134,7 +6406,17 @@ class MiteneSender:
                 self._scroll_list_to_bottom(page)
             except Exception:
                 pass
-            self._ajax_list_load_wait()
+            _perf_ajax_t0 = time.monotonic()
+            self._ajax_list_load_wait(
+                page,
+                surface,
+                _base_cards,
+                _base_height,
+                no_more_ms=(
+                    MATCH_AJAX_NO_MORE_MS if tab_name == "マッチ率" else None
+                ),
+            )
+            _perf_ajax_ms = int((time.monotonic() - _perf_ajax_t0) * 1000)
 
             scroll_height = self._get_list_scroll_height(page)
             card_count = self._count_member_cards_on_surface(surface)
@@ -5148,6 +6430,7 @@ class MiteneSender:
                     logger.warning(
                         "【%s一覧】カード解析失敗: %s", tab_name, e
                     )
+                _perf_exit = "parse_error"
                 break
 
             _merge_parse_stats(agg_stats, stats, scroll_pass=round_no)
@@ -5161,6 +6444,8 @@ class MiteneSender:
                     merged[mid] = parsed_item
 
             unique_ids = len(merged)
+            if unique_ids > prev_metrics["unique_ids"] or card_count > prev_metrics["card_count"]:
+                self._mark_progress("scan_advance")  # ⑤ 全候補取得中に実際に前進
             final_card_count = card_count
             final_scroll_height = scroll_height
 
@@ -5168,6 +6453,22 @@ class MiteneSender:
             logger.info("  カード数: %d", card_count)
             logger.info("  uniqueMemberIds: %d", unique_ids)
             logger.info("  scrollHeight: %d", scroll_height)
+
+            if _PERF_ENABLED:
+                self._perf["scroll_rounds"] = (
+                    int(self._perf.get("scroll_rounds", 0)) + 1
+                )
+                _perf_log(
+                    "scroll_round",
+                    tab=_perf_slug,
+                    round=round_no,
+                    ms_round=int((time.monotonic() - _perf_round_t0) * 1000),
+                    ajax_wait_ms=_perf_ajax_ms,
+                    card_count=card_count,
+                    unique_ids=unique_ids,
+                    scroll_height=scroll_height,
+                    stable_rounds=stable_rounds,
+                )
 
             if (
                 scroll_height == prev_metrics["scroll_height"]
@@ -5182,6 +6483,7 @@ class MiteneSender:
                         tab_name,
                         LIST_SCROLL_STABLE_ROUNDS,
                     )
+                    _perf_exit = "stable"
                     break
             else:
                 stable_rounds = 0
@@ -5203,6 +6505,7 @@ class MiteneSender:
                     expected_total,
                     unique_ids,
                 )
+                _perf_exit = "expected_total"
                 break
         else:
             logger.warning(
@@ -5210,6 +6513,7 @@ class MiteneSender:
                 tab_name,
                 LIST_SCROLL_PARSE_MAX_ROUNDS,
             )
+            _perf_exit = "max_rounds"
 
         parsed = list(merged.values())
         logger.info("【%s】最終取得", tab_name)
@@ -5235,6 +6539,18 @@ class MiteneSender:
             "scroll_passes": round_no,
             "scroll_height": final_scroll_height,
         }
+        if _PERF_ENABLED:
+            _spms = (time.monotonic() - _perf_t0) * 1000
+            self._perf_add("scroll_parse_ms", _spms)
+            _perf_log(
+                "scroll_parse_done",
+                tab=_perf_slug,
+                ms_total=int(_spms),
+                rounds=round_no,
+                final_unique=len(parsed),
+                expected_total=(expected_total if expected_total else 0),
+                early_exit_reason=_perf_exit,
+            )
         return parsed, summary
 
     def _parse_list_page_cards(
@@ -5243,9 +6559,11 @@ class MiteneSender:
         """collect_members() 内部専用: スクロール走査マージでカード取得."""
         url = page.url or ""
         if self._cached_list_url == url and self._cached_list_cards is not None:
+            self._perf_last_parse_cache_hit = True
             return [
                 c for c in self._cached_list_cards if isinstance(c, dict)
             ]
+        self._perf_last_parse_cache_hit = False
 
         history_label = self.standard.mitene_history_label
         surface = self._member_card_surface(page)
@@ -5270,7 +6588,7 @@ class MiteneSender:
         result: list[dict[str, Any]] = []
         for member in filtered:
             key = member_queue_key(member.member_id)
-            if key in self._sent_member_keys or key in self._failed_member_keys:
+            if self._is_send_blocked(key):
                 continue
             if not member.has_send_button:
                 continue
@@ -5407,7 +6725,7 @@ class MiteneSender:
         result: list[dict[str, Any]] = []
         for item in _normalize_evaluate_rows(raw):
             key = str(item.get("key", ""))
-            if not key.startswith("comeon-") or key in self._sent_member_keys:
+            if not key.startswith("comeon-") or self._is_send_blocked(key):
                 continue
             result.append(
                 {
@@ -5430,6 +6748,7 @@ class MiteneSender:
         quiet: bool = False,
     ) -> list[Member]:
         """タブごとの会員条件（未送信のみ / 送信日古い順 / 全員）— 送信済判定はここだけ."""
+        _perf_t0 = time.monotonic()
         enriched = [
             self._enrich_member_sent_fields(
                 m, history_texts.get(m.member_id, "")
@@ -5441,6 +6760,20 @@ class MiteneSender:
         log_verbose = not quiet or debug_on
         duplicates = self._debug_collect_duplicates.pop(step.tab, [])
 
+        today = date.today()
+        # 「ミテネ履歴」の値そのものに本日日付 → 本日ミテネ済 → ④⑤とも送信禁止（§4 二重ガード）。
+        # ④は not sent_history で既に除外されるが、⑤側でも last_sent==today を明示除外する。
+        hist_yes = sum(1 for m in enriched if m.sent_history)
+        hist_no = sum(
+            1 for m in enriched if m.has_send_button and not m.sent_history
+        )
+        today_done = sum(
+            1
+            for m in enriched
+            if (m.last_sent == today)
+            or (not m.has_send_button and m.member_id)
+        )
+
         mode = step.member_filter or "sendable"
         if mode == "new_only":
             filtered = [
@@ -5448,48 +6781,48 @@ class MiteneSender:
                 for m in enriched
                 if m.has_send_button
                 and not m.sent_history
-                and member_queue_key(m.member_id)
-                not in self._sent_member_keys
-                and member_queue_key(m.member_id)
-                not in self._failed_member_keys
+                and not self._is_send_blocked(m.member_id)
             ]
             if log_verbose and not debug_on:
                 logger.info(
-                    "【%s】新規会員（ミテネ履歴に「送信済」なし）: %d / %d 人",
+                    "【%s】④新規（ミテネ履歴なし）: candidate %d / history無 %d / history有 %d "
+                    "/ 本日済・送信不可 %d → Filter後 %d",
                     step.tab,
-                    len(filtered),
                     len(enriched),
+                    hist_no,
+                    hist_yes,
+                    today_done,
+                    len(filtered),
                 )
             if not filtered and enriched and log_verbose and not debug_on:
-                logger.info("【%s】未送信会員 0 人", step.tab)
+                logger.info("【%s】④新規 0 人", step.tab)
         elif mode == "sent_oldest_first":
             pool = [
                 m
                 for m in enriched
                 if m.has_send_button
                 and m.sent_history
-                and member_queue_key(m.member_id)
-                not in self._sent_member_keys
-                and member_queue_key(m.member_id)
-                not in self._failed_member_keys
+                and m.last_sent != today
+                and not self._is_send_blocked(m.member_id)
             ]
             filtered = self._sort_members_oldest_first(pool)
             if log_verbose and not debug_on:
                 logger.info(
-                    "【%s】全会員（古い順・同日ランダム）: %d / %d 人",
+                    "【%s】⑤履歴あり・古い順: candidate %d / history有 %d / history無 %d "
+                    "/ 本日済・送信不可 %d → Filter後 %d",
                     step.tab,
-                    len(filtered),
                     len(enriched),
+                    hist_yes,
+                    hist_no,
+                    today_done,
+                    len(filtered),
                 )
         else:
             filtered = [
                 m
                 for m in enriched
                 if m.has_send_button
-                and member_queue_key(m.member_id)
-                not in self._sent_member_keys
-                and member_queue_key(m.member_id)
-                not in self._failed_member_keys
+                and not self._is_send_blocked(m.member_id)
             ]
 
         self._log_pipeline_funnel_stage(step.tab, "Filter後", len(filtered))
@@ -5508,14 +6841,24 @@ class MiteneSender:
                 duplicates=duplicates,
             )
         elif log_verbose:
-            sent_n = sum(1 for m in enriched if m.sent_history)
-            unsent_n = sum(
-                1 for m in enriched if m.has_send_button and not m.sent_history
+            logger.info(
+                "【%s】ミテネ履歴判定（Member %d件）", step.tab, len(enriched)
             )
-            logger.info("【%s】送信履歴判定（Member %d件）", step.tab, len(enriched))
-            logger.info("送信済: %d", sent_n)
-            logger.info("未送信: %d", unsent_n)
+            logger.info("ミテネ履歴あり（過去送信日あり）: %d", hist_yes)
+            logger.info("ミテネ履歴なし（→④新規）: %d", hist_no)
+            logger.info("本日ミテネ済／送信不可: %d", today_done)
             logger.info("Filter後: %d", len(filtered))
+        if _PERF_ENABLED:
+            _fms = (time.monotonic() - _perf_t0) * 1000
+            self._perf_add("filter_ms", _fms)
+            _perf_log(
+                "filter_done",
+                tab=_perf_tab_slug(step.tab),
+                mode=mode,
+                ms=int(_fms),
+                in_count=len(enriched),
+                out_count=len(filtered),
+            )
         return filtered
 
     def _count_new_members_on_page(self, page: Page) -> int:
@@ -5624,35 +6967,79 @@ class MiteneSender:
         except Exception:
             return None
 
-    def _wait_confirm_layer(self, page: Page, timeout_ms: int = 5000) -> bool:
-        for sel in (
-            "#colorbox",
-            "#cboxContent",
-            "#TB_window",
-            ".remodal-wrapper",
-            '[role="dialog"]',
-        ):
-            try:
-                page.wait_for_selector(sel, state="visible", timeout=timeout_ms)
-                return True
-            except Exception:
-                continue
-        return False
+    def _wait_confirm_layer(self, page: Page, timeout_ms: int = 4000) -> bool:
+        """確認モーダルが可視になるまで待つ（複合セレクタで合計 timeout を1回だけ適用）.
+
+        旧実装は 5 セレクタを順次 wait（各 timeout_ms）で、modal が出ないときに
+        最大 timeout_ms×5 待っていた。ここでは 1 回の wait_for_selector にまとめる。
+        セレクタの意味は変えていない。
+        """
+        combined = (
+            '#colorbox, #cboxContent, #TB_window, .remodal-wrapper, [role="dialog"]'
+        )
+        try:
+            page.wait_for_selector(combined, state="visible", timeout=timeout_ms)
+            return True
+        except Exception:
+            return False
+
+    def _confirm_modal_closed(self, page: Page) -> bool:
+        """確認モーダルが（開いた後に）閉じているか（送信成功の補助シグナル）."""
+        try:
+            return not bool(
+                page.evaluate(
+                    """() => {
+                        const sel = '#colorbox, #cboxContent, #cboxLoadedContent, '
+                            + '#TB_window, .remodal-wrapper, [role="dialog"]';
+                        for (const el of document.querySelectorAll(sel)) {
+                            const s = getComputedStyle(el);
+                            if (s.display !== 'none' && s.visibility !== 'hidden'
+                                && (el.offsetParent || s.position === 'fixed')) return true;
+                        }
+                        return false;
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    def _send_error_text_visible(self, page: Page) -> bool:
+        """送信失敗を示す文言が出ているか（モーダル閉＝成功 の誤判定を防ぐ）."""
+        try:
+            return bool(
+                page.evaluate(
+                    """() => {
+                        const t = ((document.body && document.body.innerText) || '')
+                            .slice(0, 4000);
+                        return /エラー|失敗しました|送信できません|時間をおいて|通信に失敗/
+                            .test(t);
+                    }"""
+                )
+            )
+        except Exception:
+            return False
 
     def _tap_mitene_cta(self, page: Page, member_id: str) -> bool:
-        """一覧CTAをタップ（Playwright click → カード内 click → registComeon）."""
-        btn = self._kitene_button_locator(page, member_id)
+        """一覧CTAの inner <a>（onclick=registComeon）を確実にクリックする.
+
+        wrapper <div>（`.js-regist_comeon_{id}` 単独）のクリックは registComeon を
+        発火しないため、成功扱いにしない。inner <a> を掴めない場合のみ JS 経由
+        （inner <a> 優先 → 最後の手段として registComeon 直呼び）。
+        """
+        mid = str(member_id).strip()
+        btn = self._kitene_button_locator(page, mid)
         if self._safe_count(btn) > 0:
             el = btn.first
-            try:
-                el.scroll_into_view_if_needed(timeout=5000)
-            except Exception:
-                pass
-            try:
-                el.click(timeout=12000)
-                return True
-            except Exception:
-                pass
+            if self._cta_anchor_is_safe(el, mid):
+                try:
+                    el.scroll_into_view_if_needed(timeout=5000)
+                except Exception:
+                    pass
+                try:
+                    el.click(timeout=12000)
+                    return True
+                except Exception:
+                    pass
         try:
             return bool(
                 page.evaluate(
@@ -5663,16 +7050,25 @@ class MiteneSender:
                             document.querySelector('.u_' + mid),
                         ].filter(Boolean);
                         for (const root of roots) {
+                            if (root.querySelector('.kitene_send_zumi_btn')) {
+                                const z = root.querySelector('.kitene_send_zumi_btn');
+                                const zs = z ? getComputedStyle(z) : null;
+                                if (zs && zs.display !== 'none' && zs.visibility !== 'hidden'
+                                    && z.offsetParent) continue;
+                            }
                             const candidates = [
                                 ...root.querySelectorAll(
-                                    'a.kitene_send_btn__text_wrapper, .kitene_send_btn a, a, button'
+                                    'a.kitene_send_btn__text_wrapper[onclick*="registComeon"], '
+                                    + 'a[onclick*="registComeon"], '
+                                    + '.kitene_send_btn a[onclick*="registComeon"]'
                                 ),
-                                root,
                             ];
                             for (const el of candidates) {
-                                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                                if (t && !/ミテネを送る|ミテネする/.test(t)) continue;
                                 if (el.closest && el.closest('.kitene_send_zumi_btn')) continue;
+                                const oc = (el.getAttribute('onclick') || '').replace(/\\s+/g, '');
+                                if (oc.indexOf('registComeon(' + mid + ')') < 0) continue;
+                                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                                if (t.includes('送信済')) continue;
                                 el.scrollIntoView?.({ block: 'center', inline: 'nearest' });
                                 if (typeof el.click === 'function') {
                                     el.click();
@@ -5680,13 +7076,12 @@ class MiteneSender:
                                 }
                             }
                         }
-                        if (typeof registComeon === 'function') {
-                            registComeon(Number(mid));
-                            return true;
-                        }
+                        // 対象会員の inner <a> を掴めなかった → SKIP（別会員へ blind に
+                        // registComeon(mid) 直呼びはしない。確認モーダルを経ない送信は
+                        // 成立しない実績があり、かつ誤爆の恐れがあるため）。
                         return false;
                     }""",
-                    member_id,
+                    mid,
                 )
             )
         except Exception:
@@ -5702,7 +7097,33 @@ class MiteneSender:
 
         interruptible_sleep(max(0, ms) / 1000.0)
 
-    def _send_mitene_standard(self, page: Page) -> int:
+    def _mark_progress(self, reason: str) -> None:
+        """meaningful progress があったときだけ last_progress_at を更新（§4）.
+
+        呼ぶ側で「実際に前進した」ことを確認済みのイベントのみ渡すこと
+        （sleep / poll / 同一 DOM 再 parse / カード数不変 では呼ばない）。
+        """
+        self._last_progress_at = time.monotonic()
+        if _PERF_ENABLED:
+            _perf_log("progress", reason=reason, phase=self._current_phase or "-")
+
+    def _check_account_timeout(self) -> None:
+        """soft 10分制御（§1）: elapsed>=600 かつ stall>=THRESHOLD かつ critical send 中でない
+        ときだけ AccountStallTimeout。CTA/confirm/XHR 判定中は絶対に発火しない。"""
+        if self._critical_send or not self._acc_timer_on:
+            return
+        now = time.monotonic()
+        elapsed = now - self._acc_started_at
+        if elapsed < ACCOUNT_SOFT_LIMIT_SECONDS:
+            return
+        stall = now - (self._last_progress_at or self._acc_started_at)
+        if stall < ACCOUNT_STALL_THRESHOLD_SECONDS:
+            return
+        raise AccountStallTimeout(
+            f"elapsed={int(elapsed)}s stall={int(stall)}s phase={self._current_phase or '-'}"
+        )
+
+    def _send_mitene_standard(self, page: Page, sent_so_far: int = 0) -> int:
         if self.dry_run:
             logger.info("ドライラン: ログイン・残り回数の確認のみ（送信しません）")
             self._ensure_deco_home(page)
@@ -5717,18 +7138,27 @@ class MiteneSender:
         steps = self.standard.priority_steps or list(DEFAULT_PRIORITY_STEPS)
         skipped_steps: list[str] = []
 
+        _perf_bud_t0 = time.monotonic()
         budget = self._read_send_budget(page)
-        self._sent_member_keys.clear()
-        self._failed_member_keys.clear()
+        if _PERF_ENABLED:
+            _bms = (time.monotonic() - _perf_bud_t0) * 1000
+            self._perf_add("budget_ms", _bms)
+            _perf_log(
+                "budget_read_done",
+                ms=int(_bms),
+                budget=budget,
+                zero_retry=self._perf_budget_zero_retry,
+            )
+        # STEP 4 §7: _sent_member_keys / _failed_member_keys は run() が invocation 頭で
+        # 一度だけクリア済み。ここではクリアしない（retry で attempt 0 の実績を失わないため）。
         self._send_button_queue.clear()
         self._reset_debug_run_tracking()
         self._load_member_send_history()
         self._send_target = 0
-        self._send_done = 0
-        self._match_rate_had_new = None
+        sent = int(sent_so_far or 0)
+        self._send_done = sent
         self._pipeline_had_new_member = False
         self._current_step = None
-        sent = 0
         sent_by_step: dict[str, int] = {}
         self._dismiss_optional_popups(page)
 
@@ -5740,8 +7170,12 @@ class MiteneSender:
             sent = self._execute_phased_send_pipeline(
                 page, budget, sent, sent_by_step, skipped_steps
             )
-            target = budget
             self._send_target = budget
+            # ①〜⑤後の残回数確認 → 余りをランダム追加消化 → レポート確定。
+            # per-send の残回数取得は廃止し、ここで初めて再取得する。
+            return self._finalize_phased_run(
+                page, budget, sent, sent_by_step, skipped_steps
+            )
         else:
             target = budget
             self._open_find_members(page)
@@ -6155,7 +7589,12 @@ class MiteneSender:
     def _wait_kitene_send_result(
         self, page: Page, member_id: str | None, *, timeout_ms: int = 4000
     ) -> bool:
-        """registComeon クリック後、ボタンが送信済み表示になるまで待つ."""
+        """registComeon クリック後、対象会員のボタンが「本日ミテネ済」表示になるまで待つ.
+
+        STEP 4.1 §6: SUCCESS fallback として残すのは「対象 member_id のカードが明確に
+        『送信済』表示 / `.kitene_send_zumi_btn` 可視 へ変化」した場合のみ。
+        `active` クラスの有無だけ（＝単なる rerender の可能性）では SUCCESS にしない。
+        """
         poll_ms = 120 if self.human.fast_send else 250
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
@@ -6176,7 +7615,6 @@ class MiteneSender:
                                 if (zs.display !== 'none' && zs.visibility !== 'hidden'
                                     && zumi.offsetParent) return true;
                             }
-                            if (!wrap.classList.contains('active')) return true;
                             return false;
                         }""",
                         member_id,
@@ -6190,8 +7628,33 @@ class MiteneSender:
             self._pause_ms(poll_ms)
         return False
 
+    def _finish_send_success(
+        self,
+        page: Page,
+        key: str,
+        member_id: str,
+        *,
+        cta_ok: bool,
+        modal_shown: bool,
+        ok_clicked: bool,
+    ) -> bool:
+        """1件送信成功の共通後処理（成功記録 → 送信済登録 → 一覧復帰）."""
+        logger.info("送信成功 %s", key)
+        if self._member_extraction_debug_enabled():
+            self._log_per_send_debug_success(
+                cta_ok=cta_ok,
+                modal_shown=modal_shown,
+                ok_clicked=ok_clicked,
+                remaining_before=None,
+                remaining_after=None,
+            )
+        self._set_send_attempt_outcome(member_id, "成功")
+        self._mark_member_sent(key)
+        self._ensure_member_list_page(page)
+        return True
+
     def _send_one_mitene(self, page: Page) -> bool:
-        """③ピンク「ミテネを送る」→ 確認ポップアップ → 残り回数が減るまで."""
+        """③ピンク「ミテネを送る」→ 確認ポップアップ → 送信済み状態を確認."""
         if not self._send_button_queue:
             keys = self._scan_unsent_member_keys(page)
             if not keys:
@@ -6199,10 +7662,10 @@ class MiteneSender:
             key = keys[0]
         else:
             key = self._send_button_queue.pop(0)
-        if key in self._sent_member_keys or key in self._failed_member_keys:
+        if self._is_send_blocked(key):
             member_id = self._member_id_from_queue_key(key)
             self._set_send_attempt_outcome(
-                member_id, "スキップ", "既に送信済または失敗済"
+                member_id, "スキップ", "送信対象外（送信済/失敗/不確定/本日済）"
             )
             return False
         if not key.startswith("comeon-"):
@@ -6210,6 +7673,9 @@ class MiteneSender:
             return False
         member_id = key[7:]
         self._last_send_attempt = None
+        self._perf_confirm_loops = 0
+        self._perf_send_rb = None
+        self._perf_send_ra = None
         debug_send = self._member_extraction_debug_enabled()
         send_name = self._debug_member_names.get(member_id, "（名前不明）")
         cta_ok = False
@@ -6264,7 +7730,9 @@ class MiteneSender:
                             member_id, "失敗", "一覧へ戻れず"
                         )
                         return False
-            remaining_before = self._parse_remaining_count(page)
+            # per-send の残回数取得は廃止（開始時 / ①〜⑤後 / ランダム後 のみ取得）。
+            remaining_before = None
+            self._perf_send_rb = None
             btn = self._kitene_button_locator(page, member_id)
             if self._safe_count(btn) == 0 or not self._safe_is_visible(btn.first):
                 step = self._current_step
@@ -6277,6 +7745,12 @@ class MiteneSender:
                 key,
                 len(self._send_button_queue),
             )
+            # STEP 4 §5: これ以降に観測する /J10AjaxComeon.php を今回の送信の実結果とみなす
+            _ajax_mark = time.monotonic()
+            # STEP 6 §5: ここから SUCCESS/FAILURE/UNCERTAIN 確定まで critical send section。
+            # この間は account stall timeout を発火させない（finally で必ず解除）。
+            self._critical_send = True
+            self._mark_progress("send_start")
             if not self._tap_mitene_cta(page, member_id):
                 self._pause_ms(500)
                 self._dismiss_optional_popups(page)
@@ -6306,90 +7780,61 @@ class MiteneSender:
             else:
                 self.human.action_pause()
             self._pause_ms(250 if self.human.fast_send else 600)
-            modal_shown = self._wait_confirm_layer(page, timeout_ms=4000)
+            modal_shown = self._wait_confirm_layer(page, timeout_ms=3000)
             confirm_wait = 350 if self.human.fast_send else 800
-            for _ in range(4):
+            for _ in range(3):
+                self._perf_confirm_loops += 1
                 if self._confirm_send_dialog(page):
                     ok_clicked = True
                 self._pause_ms(confirm_wait)
-                remaining_after = self._parse_remaining_count(page)
-                if (
-                    remaining_before is not None
-                    and remaining_after is not None
-                    and remaining_after < remaining_before
-                ):
-                    logger.info(
-                        "送信成功 %s（残り %d → %d）",
-                        key,
-                        remaining_before,
-                        remaining_after,
+                # STEP 4 §5-C/§5-D: 実 XHR の process_status を最優先で判定
+                _v = self._ajax_comeon_verdict(member_id, since=_ajax_mark)
+                if _v == "success":
+                    logger.info("送信成功（XHR process_status=success）%s", key)
+                    return self._finish_send_success(
+                        page, key, member_id,
+                        cta_ok=cta_ok, modal_shown=modal_shown, ok_clicked=ok_clicked,
                     )
-                    if debug_send:
-                        self._log_per_send_debug_success(
-                            cta_ok=cta_ok,
-                            modal_shown=modal_shown,
-                            ok_clicked=ok_clicked,
-                            remaining_before=remaining_before,
-                            remaining_after=remaining_after,
-                        )
-                    self._set_send_attempt_outcome(member_id, "成功")
-                    self._mark_member_sent(key)
-                    self._ensure_member_list_page(page)
-                    return True
-                if self._wait_kitene_send_result(page, member_id, timeout_ms=1200):
-                    if debug_send:
-                        if remaining_after is None:
-                            remaining_after = self._parse_remaining_count(page)
-                        self._log_per_send_debug_success(
-                            cta_ok=cta_ok,
-                            modal_shown=modal_shown,
-                            ok_clicked=ok_clicked,
-                            remaining_before=remaining_before,
-                            remaining_after=remaining_after,
-                        )
-                    self._set_send_attempt_outcome(member_id, "成功")
-                    self._mark_member_sent(key)
-                    self._ensure_member_list_page(page)
-                    return True
-            remaining_after = self._parse_remaining_count(page)
-            if (
-                remaining_before is not None
-                and remaining_after is not None
-                and remaining_after < remaining_before
-            ):
-                logger.info(
-                    "送信成功 %s（残り %d → %d）",
-                    key,
-                    remaining_before,
-                    remaining_after,
+                if _v == "failure":
+                    logger.info("送信失敗（XHR process_status≠success）%s", key)
+                    self._register_failed_member_key(key)
+                    self._set_send_attempt_outcome(
+                        member_id, "失敗", "XHR process_status≠success"
+                    )
+                    return False
+                # SUCCESS fallback（§6 KEEP）= 対象会員カードが「送信済 / zumi 可視」へ変化。
+                # ※ modal-close-only success は STEP 4.1 §5 で完全削除。
+                if self._wait_kitene_send_result(page, member_id, timeout_ms=1000):
+                    return self._finish_send_success(
+                        page, key, member_id,
+                        cta_ok=cta_ok, modal_shown=modal_shown, ok_clicked=ok_clicked,
+                    )
+            if self._wait_kitene_send_result(page, member_id, timeout_ms=3000):
+                return self._finish_send_success(
+                    page, key, member_id,
+                    cta_ok=cta_ok, modal_shown=modal_shown, ok_clicked=ok_clicked,
                 )
-                if debug_send:
-                    self._log_per_send_debug_success(
-                        cta_ok=cta_ok,
-                        modal_shown=modal_shown,
-                        ok_clicked=ok_clicked,
-                        remaining_before=remaining_before,
-                        remaining_after=remaining_after,
-                    )
-                self._set_send_attempt_outcome(member_id, "成功")
-                self._mark_member_sent(key)
-                self._ensure_member_list_page(page)
-                return True
-            if self._wait_kitene_send_result(page, member_id, timeout_ms=5000):
-                if debug_send:
-                    if remaining_after is None:
-                        remaining_after = self._parse_remaining_count(page)
-                    self._log_per_send_debug_success(
-                        cta_ok=cta_ok,
-                        modal_shown=modal_shown,
-                        ok_clicked=ok_clicked,
-                        remaining_before=remaining_before,
-                        remaining_after=remaining_after,
-                    )
-                self._set_send_attempt_outcome(member_id, "成功")
-                self._mark_member_sent(key)
-                self._ensure_member_list_page(page)
-                return True
+            # 補助シグナル（診断・reconciliation 用）: 予算 vs 残回数の照合を1回だけ記録。
+            # ※ STEP 4.1: これ単独では SUCCESS に昇格させない（authoritative は
+            #   process_status=="success" / 対象会員の「送信済」表示のみ）。
+            remaining_after = self._parse_remaining_count(page)
+            self._perf_send_ra = remaining_after
+            budget_hint_ok = (
+                remaining_after is not None
+                and self._locked_send_budget is not None
+                and remaining_after <= (self._locked_send_budget - self._send_done - 1)
+            )
+            if budget_hint_ok:
+                logger.info(
+                    "残回数は期待通り減少（%s / 期待上限 %s）だが XHR/送信済表示が未確認 "
+                    "→ UNCERTAIN 扱い %s",
+                    remaining_after,
+                    self._locked_send_budget - self._send_done - 1,
+                    key,
+                )
+            # 認可的な成功を確認できなかった → UNCERTAIN（sent++/member_sends なし・
+            # 同一 run/当日 再クリックしない）。既存の失敗集計にも入れて確実に block。
+            self._uncertain_member_keys.add(key)
             self._register_failed_member_key(key)
             if len(self._failed_member_keys) <= 2:
                 self._save_debug_screenshot(page, f"send-fail-{member_id}")
@@ -6411,9 +7856,12 @@ class MiteneSender:
                     remaining_after=remaining_after,
                     reason=f"残回数未減少（状態: {fail_state}）",
                 )
-            self._set_send_attempt_outcome(
-                member_id, "失敗", f"残回数未減少（状態: {fail_state}）"
+            _outcome_reason = (
+                "認可的成功を確認できず（残回数は減少・XHR未確認）"
+                if budget_hint_ok
+                else f"認可的成功を確認できず（状態: {fail_state}）"
             )
+            self._set_send_attempt_outcome(member_id, "不確定", _outcome_reason)
         except Exception as e:
             if _is_destroyed_context_error(e):
                 self._wait_page_settled(page, quick=True)
@@ -6430,6 +7878,11 @@ class MiteneSender:
                     reason=f"例外: {e}",
                 )
             self._set_send_attempt_outcome(member_id, "失敗", f"例外: {e}")
+        finally:
+            # STEP 6: critical send section を必ず解除（例外時も True で残さない）。
+            # 1件の送信試行が確定して次候補へ進む＝meaningful progress。
+            self._critical_send = False
+            self._mark_progress("send_result")
         return False
 
     def _confirm_send_dialog(self, page: Page) -> bool:

@@ -13,9 +13,16 @@ def is_no_remaining_result(r: dict[str, Any]) -> bool:
     return r.get("status") == "no_remaining"
 
 
+def is_completed_with_remaining_result(r: dict[str, Any]) -> bool:
+    return r.get("status") == "completed_with_remaining"
+
+
 def classify_result(r: dict[str, Any]) -> str:
     if r.get("skipped"):
         return "skipped"
+    if is_completed_with_remaining_result(r):
+        # 残り回数 > 0 だが安全な送信候補なし。ERROR ではなく完了系。
+        return "completed_with_remaining"
     if r.get("status") == "zero_send":
         return "error"
     if r.get("dry_run"):
@@ -39,6 +46,12 @@ def _detail_for_completed(r: dict[str, Any], kind: str, *, dry_run: bool) -> str
     if kind == "dry_run" or dry_run:
         return "ドライラン（送信なし）"
     sent = int(r.get("sent") or 0)
+    if kind == "completed_with_remaining":
+        rem = r.get("remaining")
+        base = f"{sent} 件送信" if sent > 0 else "送信対象なし"
+        if isinstance(rem, int) and rem > 0:
+            return f"完了（送信可能な対象なし・残り{rem}件）"
+        return f"完了（送信可能な対象なし）／{base}"
     if sent > 0:
         return f"{sent} 件送信"
     if kind == "no_remaining":
@@ -86,7 +99,7 @@ def build_run_display(
 
         if kind == "skipped":
             continue
-        if kind in ("success", "no_remaining", "dry_run"):
+        if kind in ("success", "no_remaining", "dry_run", "completed_with_remaining"):
             completed.append(
                 {
                     "name": name,

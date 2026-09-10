@@ -463,11 +463,7 @@ def is_system_busy() -> bool:
     with _lock:
         if _direct_run_depth > 0:
             return True
-    if has_running_jobs():
-        return True
-    from scheduler_service import is_scheduled_run_in_progress
-
-    return is_scheduled_run_in_progress()
+    return has_running_jobs()
 
 
 def validate_before_run(group: str = "all") -> str | None:

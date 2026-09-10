@@ -255,35 +255,6 @@ def run_server_only(port: int) -> int:
     return 0
 
 
-def run_scheduled() -> int:
-    setup_runtime()
-    os.chdir(ROOT)
-    sys.path.insert(0, str(ROOT / "src"))
-    import logging
-
-    from scheduler_service import run_all_scheduled
-
-    log_path = ROOT / "logs" / "scheduled.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    results = run_all_scheduled()
-    if not results:
-        logging.info("送信対象なし（OFF・時間外・実行済みなど）")
-        return 0
-    if results and results[0].get("error"):
-        logging.warning("スキップ: %s", results[0]["error"])
-        return 0
-    logging.info("完了: %d 件", len(results))
-    return 0
-
-
 def run_install_browsers() -> int:
     os.chdir(ROOT)
     from playwright_setup import ensure_chromium
@@ -380,8 +351,6 @@ def _bootstrap_from_argv() -> int | None:
             if arg.startswith("--port="):
                 port = int(arg.split("=", 1)[1])
         return run_server_only(port)
-    if mode == "--scheduled":
-        return run_scheduled()
     if mode == "--install-browsers":
         return run_install_browsers()
     return None

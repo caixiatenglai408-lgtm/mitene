@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import logging
+import locale as _locale
+import re as _re
+import unicodedata as _ud
 import uuid
-from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
@@ -32,27 +33,7 @@ WEEKDAY_LABELS = {
     "sat": "土",
     "sun": "日",
 }
-SLOTS = {
-    "09:00": "午前9時",
-    "19:00": "午後7時",
-    "00:00": "午前0時",
-}
-# 表示・実行順（辞書の並びと同じ）
-SLOT_KEYS = list(SLOTS.keys())
-# 各枠の実行可能時間（時, 分未満）— 手動風待機のため30分間
-SLOT_WINDOWS: dict[str, tuple[int, int]] = {
-    "09:00": (9, 30),
-    "00:00": (0, 30),
-    "19:00": (19, 30),
-}
-# 旧設定のキー → 新キー（移行用）
-_LEGACY_SLOT_MAP = {"12:00": "00:00"}
 JST = ZoneInfo("Asia/Tokyo")
-
-
-def default_schedule() -> dict[str, dict[str, bool]]:
-    empty_day = {slot: False for slot in SLOT_KEYS}
-    return {day: dict(empty_day) for day in WEEKDAYS}
 
 
 @dataclass
@@ -61,6 +42,9 @@ class Account:
     name: str
     login_id: str
     password: str
+    # 並び順用の読み仮名（ひらがな・任意）。漢字→かなの自動推測はしない。
+    # 未設定（""）は後方互換。cast_sort_key で「未設定グループ」として末尾に寄せる。
+    name_kana: str = ""
     enabled: bool = True
     created_at: str = ""
     updated_at: str = ""
@@ -69,6 +53,7 @@ class Account:
         return {
             "id": self.id,
             "name": self.name,
+            "name_kana": self.name_kana,
             "login_id": self.login_id,
             "enabled": self.enabled,
             "has_password": bool(self.password),
@@ -79,13 +64,8 @@ class Account:
 
 @dataclass
 class Settings:
-    automation_enabled: bool = False
     base_url: str = ""
-    schedule: dict[str, dict[str, bool]] = field(default_factory=default_schedule)
-    last_run_slot: str = ""
-    # macOS: スリープ中も launchd で定時送信（管理画面が閉じていても可）
-    sleep_schedule_enabled: bool = True
-    # 直近の送信結果（手動・自動共通の表示用）
+    # 直近の送信結果（手動送信の表示用）
     last_run: dict[str, Any] | None = None
     # 本日出勤（チェックした女の子を優先送信）— attendance_date とセットで保存
     attendance_date: str = ""
@@ -93,11 +73,7 @@ class Settings:
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
-            "automation_enabled": self.automation_enabled,
             "base_url": self.base_url,
-            "schedule": self.schedule,
-            "last_run_slot": self.last_run_slot,
-            "sleep_schedule_enabled": self.sleep_schedule_enabled,
             "attendance_date": self.attendance_date,
             "working_today_ids": list(self.working_today_ids),
         }
@@ -114,64 +90,22 @@ def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _normalize_schedule(schedule: dict) -> dict[str, dict[str, bool]]:
-    """全曜日・全時間枠が揃うよう補完（旧12:00→00:00へ移行）."""
-    normalized = default_schedule()
-    for day in WEEKDAYS:
-        day_data = dict(schedule.get(day) or {})
-        for old_key, new_key in _LEGACY_SLOT_MAP.items():
-            if old_key in day_data and new_key not in day_data:
-                day_data[new_key] = day_data[old_key]
-        for slot in SLOT_KEYS:
-            if slot in day_data:
-                normalized[day][slot] = bool(day_data[slot])
-        # 同一曜日は1枠のみ（先頭のONを残す）
-        enabled = [s for s in SLOT_KEYS if normalized[day][s]]
-        if len(enabled) > 1:
-            keep = enabled[0]
-            for slot in SLOT_KEYS:
-                normalized[day][slot] = slot == keep
-    return normalized
-
-
 def load_settings() -> Settings:
     _ensure_data_dir()
     raw = _read_settings_payload(SETTINGS_PATH)
     if raw is None:
         return Settings()
-    schedule = _normalize_schedule(raw.get("schedule") or {})
     last_run = raw.get("last_run")
-    settings = Settings(
-        automation_enabled=bool(raw.get("automation_enabled", False)),
+    # 旧キー（automation_enabled / schedule / last_run_slot / sleep_schedule_enabled）は
+    # 読み込まない。次回 save_settings 時に to_dict() から自然に落ちる（migration 不要）。
+    return Settings(
         base_url=str(raw.get("base_url", "")),
-        schedule=schedule,
-        last_run_slot=str(raw.get("last_run_slot", "")),
-        sleep_schedule_enabled=bool(raw.get("sleep_schedule_enabled", True)),
         last_run=last_run if isinstance(last_run, dict) else None,
         attendance_date=str(raw.get("attendance_date", "")),
         working_today_ids=[
             str(i) for i in (raw.get("working_today_ids") or []) if str(i)
         ],
     )
-    # 時間枠の追加・削除・移行時は settings.json を更新
-    merged_raw = raw.get("schedule") or {}
-    legacy_keys = set(_LEGACY_SLOT_MAP) | {"18:00"}
-    needs_save = any(
-        slot not in (merged_raw.get(day) or {})
-        for day in WEEKDAYS
-        for slot in SLOT_KEYS
-    ) or any(
-        k in (merged_raw.get(day) or {})
-        for day in WEEKDAYS
-        for k in legacy_keys
-    ) or any(
-        sum(1 for s in SLOT_KEYS if (merged_raw.get(day) or {}).get(s))
-        > 1
-        for day in WEEKDAYS
-    )
-    if needs_save:
-        save_settings(settings)
-    return settings
 
 
 def save_last_run_report(
@@ -196,20 +130,11 @@ def save_last_run_report(
 
 
 def save_settings(settings: Settings) -> None:
-    import sys
-
     _ensure_data_dir()
     _write_settings_payload(
         SETTINGS_PATH,
         settings.to_dict(),
     )
-    if sys.platform in ("darwin", "win32"):
-        try:
-            from platform_schedule import sync_platform_schedule
-
-            sync_platform_schedule(settings)
-        except Exception:
-            logging.getLogger(__name__).exception("OS 定時登録の同期に失敗")
 
 
 def load_accounts() -> list[Account]:
@@ -225,6 +150,7 @@ def load_accounts() -> list[Account]:
                 name=row.get("name", ""),
                 login_id=row.get("login_id", ""),
                 password=decrypt_secret(row.get("password", "")),
+                name_kana=str(row.get("name_kana", "") or ""),
                 enabled=bool(row.get("enabled", True)),
                 created_at=row.get("created_at", ""),
                 updated_at=row.get("updated_at", ""),
@@ -258,6 +184,74 @@ def normalize_display_name(name: str) -> str:
     return name.strip().replace("\u3000", " ").strip()
 
 
+# \u65e5\u672c\u8a9e\u30ed\u30b1\u30fc\u30eb\uff08\u7167\u5408\u7528\u9014\u306e\u307f\u30fb\u5931\u6557\u3057\u3066\u3082\u81f4\u547d\u7684\u3067\u306a\u3044\uff09
+for _loc in ("ja_JP.UTF-8", "ja_JP.utf8", "ja_JP", "ja"):
+    try:
+        _locale.setlocale(_locale.LC_COLLATE, _loc)
+        break
+    except _locale.Error:
+        continue
+
+# \u5168\u89d2\u30ab\u30bf\u30ab\u30ca \u2192 \u3072\u3089\u304c\u306a\uff08\u304b\u306a\u540d\u3092\u300c\u3042\u3044\u3046\u3048\u304a\u300d\u9806\u306b\u305d\u308d\u3048\u308b\u3002\u8aad\u307f\u4eee\u540dDB\u306f\u4f5c\u3089\u306a\u3044\uff09
+# \u203b str.translate \u306f\u30b3\u30fc\u30c9\u30dd\u30a4\u30f3\u30c8\uff08int\uff09\u30ad\u30fc\u306e\u5bfe\u5fdc\u8868\u304c\u5fc5\u8981
+_KANA_FOLD = {c: c - 0x60 for c in range(0x30A1, 0x30F7)}  # \u30a1..\u30f6 \u2192 \u3041..\u3096
+_KANA_FOLD[0x30FD] = 0x309D  # \u30fd \u2192 \u309d
+_KANA_FOLD[0x30FE] = 0x309E  # \u30fe \u2192 \u309e
+
+
+def account_display_sort_key(name: str):
+    """\u767b\u9332\u4e00\u89a7\u306e\u8868\u793a\u9806\uff08\u3042\u3044\u3046\u3048\u304a\u9806\u76f8\u5f53\u30fb\u5b89\u5b9a\u30bd\u30fc\u30c8\uff09.
+
+    \u8aad\u307f\u4eee\u540dDB\uff0f\u8aad\u307f\u4eee\u540d\u5165\u529b\u6b04\u306f\u4f5c\u3089\u306a\u3044\u3002\u5168\u89d2\u30ab\u30ca\u3092\u3072\u3089\u304c\u306a\u3078\u7573\u3093\u3060\u4e0a\u3067
+    \u6b63\u898f\u5316\u6587\u5b57\u5217\u9806\u306b\u4e26\u3079\u308b\uff08\u304b\u306a\u540d\u306f\u300c\u3042\u3044\u3046\u3048\u304a\u300d\u9806\u3001\u6f22\u5b57\u306f\u8868\u8a18\u306e\u307e\u307e
+    \u30b3\u30fc\u30c9\u30dd\u30a4\u30f3\u30c8\u9806\uff09\u3002\u7a7a\u306e\u8868\u793a\u540d\u306f\u672b\u5c3e\u3002\u4fdd\u5b58\u9806\u306f\u4e00\u5207\u5909\u66f4\u3057\u306a\u3044\u3002
+    """
+    norm = normalize_display_name(name)
+    folded = norm.translate(_KANA_FOLD).casefold()
+    return (norm == "", folded)
+
+
+def normalize_sort_kana(text: str) -> str:
+    """並び順用の読み仮名を正規化する（漢字→かなの推測は一切しない）.
+
+    - NFKC 正規化（全角/半角・互換文字を統一）
+    - カタカナ → ひらがな（_KANA_FOLD）
+    - 空白（半角/全角/タブ等）を完全除去
+      → 「あきよし れん」「あきよし　れん」「あきよしれん」を同一の並び位置にする
+    - casefold（英字混在時の安定化）
+    未設定（空文字）はそのまま "" を返す。
+    """
+    if not text:
+        return ""
+    s = _ud.normalize("NFKC", str(text))
+    s = s.translate(_KANA_FOLD)
+    s = _re.sub(r"\s+", "", s)
+    return s.casefold()
+
+
+def cast_sort_key(account: "Account") -> tuple:
+    """キャスト並び順の source of truth（登録一覧・出勤チェック・全員送信 共通）.
+
+    第一: 読み仮名（normalize_sort_kana 済み）。未設定は「未設定グループ」として末尾へ。
+    第二: 表示名のフォールバックキー（account_display_sort_key）。
+    第三: 安定 id（同じ読み仮名でも順序が毎回変わらない deterministic sort）。
+
+    漢字→かなの自動推測はしない。読み仮名未設定を「正式な五十音順」とはみなさず、
+    kana 設定済みキャストより後ろへまとめる（アプリは壊さない fallback）。
+    """
+    kana = normalize_sort_kana(getattr(account, "name_kana", "") or "")
+    name_key = account_display_sort_key(getattr(account, "name", "") or "")
+    has_no_kana = 1 if kana == "" else 0
+    return (has_no_kana, kana, name_key, str(getattr(account, "id", "")))
+
+
+def accounts_sorted_for_display(
+    accounts: list["Account"] | None = None,
+) -> list["Account"]:
+    src = accounts if accounts is not None else load_accounts()
+    return sorted(src, key=cast_sort_key)
+
+
 def has_duplicate_name(name: str, exclude_id: str | None = None) -> bool:
     """登録一覧に同じ表示名があるか（更新時は自分自身を除く）."""
     key = normalize_display_name(name)
@@ -277,9 +271,11 @@ def upsert_account(
     password: str,
     account_id: str | None = None,
     enabled: bool = True,
+    name_kana: str | None = None,
 ) -> Account:
     accounts = load_accounts()
     now = _now_iso()
+    kana_in = ("" if name_kana is None else str(name_kana)).strip()
     if account_id:
         for i, a in enumerate(accounts):
             if a.id == account_id:
@@ -288,6 +284,8 @@ def upsert_account(
                     name=name.strip(),
                     login_id=login_id.strip(),
                     password=password if password else a.password,
+                    # name_kana 未指定（None）なら既存値を保持。空文字は「クリア」を許可。
+                    name_kana=a.name_kana if name_kana is None else kana_in,
                     enabled=enabled,
                     created_at=a.created_at,
                     updated_at=now,
@@ -301,6 +299,7 @@ def upsert_account(
         name=name.strip(),
         login_id=login_id.strip(),
         password=password,
+        name_kana=kana_in,
         enabled=enabled,
         created_at=now,
         updated_at=now,
@@ -319,6 +318,7 @@ def set_account_enabled(account_id: str, enabled: bool) -> Account:
                 name=a.name,
                 login_id=a.login_id,
                 password=a.password,
+                name_kana=a.name_kana,
                 enabled=enabled,
                 created_at=a.created_at,
                 updated_at=_now_iso(),
@@ -338,28 +338,6 @@ def delete_account(account_id: str) -> bool:
     if auth_file.exists():
         auth_file.unlink()
     return True
-
-
-def toggle_schedule(day: str, slot: str) -> Settings:
-    if day not in WEEKDAYS or slot not in SLOTS:
-        raise ValueError("不正な曜日または時間です")
-    settings = load_settings()
-    settings.schedule = deepcopy(settings.schedule)
-    turning_on = not settings.schedule[day][slot]
-    if turning_on:
-        for s in SLOT_KEYS:
-            settings.schedule[day][s] = s == slot
-    else:
-        settings.schedule[day][slot] = False
-    save_settings(settings)
-    return settings
-
-
-def set_automation(enabled: bool) -> Settings:
-    settings = load_settings()
-    settings.automation_enabled = enabled
-    save_settings(settings)
-    return settings
 
 
 def attendance_today_key(now: datetime | None = None) -> str:
@@ -427,58 +405,46 @@ def reset_working_today() -> Settings:
 
 
 def order_accounts_by_attendance(accounts: list[Account]) -> list[Account]:
+    """本日出勤 → お休み の順。各グループ内は cast_sort_key（五十音順）で統一."""
     working_ids = load_working_today_ids()
-    working = [a for a in accounts if a.id in working_ids]
-    off = [a for a in accounts if a.id not in working_ids]
+    working = sorted(
+        (a for a in accounts if a.id in working_ids), key=cast_sort_key
+    )
+    off = sorted(
+        (a for a in accounts if a.id not in working_ids), key=cast_sort_key
+    )
     return working + off
 
 
 
 
 def partition_enabled_by_attendance() -> tuple[list[Account], list[Account]]:
+    """送信対象（enabled）を「本日出勤 / お休み」へ分割.
+
+    各グループ内は cast_sort_key（読み仮名ベースの五十音順・deterministic）で整列する。
+    これが「登録一覧の表示」「出勤チェックパネル」「今すぐ全員送信の処理順」すべての
+    共通の並び順になる（UI 表示順 == 実送信順）。
+    """
     enabled = [a for a in load_accounts() if a.enabled]
     working_ids = load_working_today_ids()
-    working = [a for a in enabled if a.id in working_ids]
-    off = [a for a in enabled if a.id not in working_ids]
+    working = sorted(
+        (a for a in enabled if a.id in working_ids), key=cast_sort_key
+    )
+    off = sorted(
+        (a for a in enabled if a.id not in working_ids), key=cast_sort_key
+    )
     return working, off
 
 
 def accounts_for_manual_group(group: str) -> list[Account]:
-    """手動送信の順序（本日出勤一覧→お休み一覧の表示順）."""
+    """手動送信の処理順（本日出勤→お休み。各グループ内は五十音順）.
+
+    partition_enabled_by_attendance が cast_sort_key で整列済みなので、
+    ここでは順序を作り直さない（UI と同一順）。
+    """
     working, off = partition_enabled_by_attendance()
     if group == "working":
         return list(working)
     if group == "off":
         return list(off)
     return list(working) + list(off)
-
-
-def current_slot_key(now: datetime | None = None) -> str | None:
-    """現在が送信スロットなら '09:00' / '00:00' / '19:00' など."""
-    now = now or datetime.now(JST)
-    for slot_key, (hour, minute_limit) in SLOT_WINDOWS.items():
-        if now.hour == hour and now.minute < minute_limit:
-            return slot_key
-    return None
-
-
-def weekday_key(now: datetime | None = None) -> str:
-    now = now or datetime.now(JST)
-    return WEEKDAYS[now.weekday()]
-
-
-def is_scheduled_now(settings: Settings, now: datetime | None = None) -> bool:
-    if not settings.automation_enabled:
-        return False
-    now = now or datetime.now(JST)
-    slot = current_slot_key(now)
-    if not slot:
-        return False
-    day = weekday_key(now)
-    return bool(settings.schedule.get(day, {}).get(slot))
-
-
-def run_slot_id(now: datetime | None = None) -> str:
-    now = now or datetime.now(JST)
-    slot = current_slot_key(now) or "manual"
-    return f"{now.date().isoformat()}_{slot}"

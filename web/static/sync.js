@@ -46,23 +46,6 @@
   }
 
   function applyIndexPage(data) {
-    const badge = document.getElementById("automation-badge");
-    const onBtn = document.getElementById("btn-automation-on");
-    const offBtn = document.getElementById("btn-automation-off");
-    if (badge && onBtn && offBtn) {
-      if (data.automation_enabled) {
-        badge.textContent = "ON";
-        badge.className = "status-badge on";
-        onBtn.classList.add("active");
-        offBtn.classList.remove("active");
-      } else {
-        badge.textContent = "OFF";
-        badge.className = "status-badge off";
-        onBtn.classList.remove("active");
-        offBtn.classList.add("active");
-      }
-    }
-
     const countEl = document.getElementById("accounts-count-hint");
     if (countEl) {
       countEl.textContent = String(data.accounts_count ?? 0);

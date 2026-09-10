@@ -25,7 +25,11 @@
     <input type="hidden" name="confirm_duplicate" id="confirm_duplicate" value="0">
     <div>
       <label for="name">表示名（管理用）</label>
-      <input type="text" id="name" name="name" placeholder="例: あいり" required>
+      <input type="text" id="name" name="name" placeholder="例: 山田 花子" required>
+    </div>
+    <div>
+      <label for="name_kana">読み仮名（並び順用・ひらがな）</label>
+      <input type="text" id="name_kana" name="name_kana" placeholder="例: やまだ はなこ">
     </div>
     <div>
       <label for="login_id">女の子ID or メールアドレス</label>
@@ -58,7 +62,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='account_list.js') }}?v=5"></script>
+<script src="{{ url_for('static', filename='account_list.js') }}?v=6"></script>
 <script>
 window.existingAccountsData = [
   {% for a in accounts %}
@@ -126,6 +130,7 @@ duplicateModal.addEventListener("click", (e) => {
 document.getElementById("btn-clear-form").onclick = () => {
   document.getElementById("account_id").value = "";
   document.getElementById("name").value = "";
+  document.getElementById("name_kana").value = "";
   document.getElementById("login_id").value = "";
   document.getElementById("password").value = "";
   document.getElementById("enabled").checked = true;

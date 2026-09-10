@@ -168,6 +168,15 @@
       });
     } else if (r.status === "no_remaining") {
       completed.push({ name: accountName, detail: "ミテネ残り回数なし" });
+    } else if (r.status === "completed_with_remaining") {
+      const rem = Number(r.remaining || 0);
+      completed.push({
+        name: accountName,
+        detail:
+          rem > 0
+            ? `完了（送信可能な対象なし・残り${rem}件）`
+            : "完了（送信可能な対象なし）",
+      });
     } else {
       errors.push({
         name: accountName,
