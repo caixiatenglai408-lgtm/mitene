@@ -2193,7 +2193,7 @@ class MiteneSender:
                     return True
         return False
 
-    def _attempt_login(self, page: Page) -> tuple[bool, str]:
+    def _attempt_login(self, page: Page, *, attempt: int = 0) -> tuple[bool, str]:
         """ID/PW 入力 → 送信 → 5秒待機 → DOM で成否判定."""
         logger.info("①ログイン画面: ID・パスワードを入力")
         self._fill_login_form(page)
@@ -2206,7 +2206,42 @@ class MiteneSender:
         self._wait_page_settled(page, quick=True)
         self.human.after_login_pause()
 
-        if self._has_login_error(page):
+        try:
+            login_error = self._has_login_error(page)
+        except PlaywrightTimeoutError as e:
+            # BODY TIMEOUT ROOT CAUSE AUDIT: ログイン送信直後、ページがまだ安定して
+            # いない状態で _has_login_error() の body 読取が 45s timeout することが
+            # ある。1回の timeout だけで即 account error にせず、既存のログイン
+            # 再試行（_ensure_logged_in の LOGIN_MAX_ATTEMPTS ループ）へ委ねる。
+            # ※ ここで再送信はしない（実際はログイン成功している可能性があるため）。
+            try:
+                url = page.url
+            except Exception:
+                url = "?"
+            logger.warning(
+                "login body timeout: account=%s attempt=%s/%s "
+                "operation=login_error_check url=%s error_type=%s error=%s",
+                self.login_id,
+                attempt or "?",
+                LOGIN_MAX_ATTEMPTS,
+                url,
+                type(e).__name__,
+                str(e).replace("\n", " ")[:200],
+            )
+            try:
+                self._save_debug_screenshot(page, "login_timeout")
+            except Exception:  # noqa: BLE001 - スクリーンショット失敗で retry を止めない
+                pass
+            # Timeout は「画面確認」の失敗であり、ログイン自体は成功している
+            # 可能性がある。再送信せず、まず既存のログイン済み判定で確認する。
+            if self._looks_logged_in(page):
+                return True, ""
+            return (
+                False,
+                "ログイン画面の読み込みがタイムアウトしました。再試行します。",
+            )
+
+        if login_error:
             return (
                 False,
                 "女の子IDまたはパスワードが正しくありません。"
@@ -2251,7 +2286,7 @@ class MiteneSender:
                     self._finish_logged_in(page)
                     return
 
-                ok, err = self._attempt_login(page)
+                ok, err = self._attempt_login(page, attempt=attempt)
                 if ok:
                     logger.info("①ログイン成功 → ②ホームへ")
                     self._perf_login_attempts = attempt
