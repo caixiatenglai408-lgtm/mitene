@@ -2634,18 +2634,39 @@ class MiteneSender:
         return bool(zero_sources & {"cta", "label", "retry", "list"})
 
     def _mitene_used_up_visible(self, page: Page) -> bool:
-        """「本日分のミテネは使い切りました」等の表示があるか（＝残 0 の確証）."""
-        try:
-            body = page.inner_text("body") or ""
-        except Exception:
-            return False
-        body = body[:6000]
-        return bool(
-            re.search(r"(ミテネ|きてね|キテネ).{0,6}(使い切|使いきり|使い切りました)", body)
-            or ("本日分" in body and "使い切" in body)
-            or "残り回数は0回" in body
-            or "残り回数：0回" in body
+        """通常ミテネの可視ラベルだけで残0を確認（スーパーは別枠）.
+
+        本文全体は検索しない。正の通常残数と使い切り表示が併存する場合も、
+        ここでは0を確定せず、呼び出し元の数値取得へ委ねる。
+        """
+        numeric = re.compile(
+            r"^\s*ミテネ残り回数\s*[：:]?\s*([0-9０-９]+)\s*回?\s*$"
         )
+        exhausted = re.compile(
+            r"^\s*(?:本日分の\s*)?(?:ミテネ|きてね|キテネ)\s*は\s*"
+            r"使い(?:切|き)(?:りました|りました[。！!]|った|り)\s*[。！!]?\s*$"
+        )
+        zero = False
+        try:
+            for pattern in (numeric, exhausted):
+                labels = page.get_by_text(pattern)
+                for i in range(labels.count()):
+                    label = labels.nth(i)
+                    if not label.is_visible():
+                        continue
+                    text = label.inner_text()
+                    match = numeric.fullmatch(text)
+                    if match:
+                        value = int(_normalize_digits(match.group(1)))
+                        if value > 0:
+                            return False
+                        zero = True
+                    elif exhausted.fullmatch(text):
+                        zero = True
+        except Exception:
+            # 読取失敗は残0の根拠にしない。
+            return False
+        return zero
 
     def _go_find_members_for_remaining(self, page: Page) -> None:
         """§5: 残回数は「ミテネできる会員を探す」画面で見る。そこへ遷移する（失敗は握る）."""
